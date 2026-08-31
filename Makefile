@@ -1,6 +1,12 @@
-.PHONY: setup-jaka run-jaka
+.PHONY: setup-jaka run-jaka build
 
 IP ?= 10.5.5.100
+
+build:
+	cargo build --release
+	mkdir -p build
+	cp target/release/jaka-cli build/jaka-cli
+	@echo "Binary copied to build/jaka-cli"
 
 run-jaka:
 	cargo run -- --ip $(IP) rot
