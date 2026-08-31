@@ -1,0 +1,41 @@
+jaka-cli - JAKA robotic arm driver
+
+Usage:
+  jaka-cli [options] <command>
+
+Commands:
+  status      Read robot state: estop, power, enable, joint angles
+  power-on    Power on and enable the robot to hold position
+  power-off   Disable servos and power off
+  estop-clear Clear the e-stop error state, release the physical button first
+  inspect     Print the joint angles in degrees as JSON to stdout
+  rot         Power on, enable, then rotate the specified joint
+  restore     Restore the joint angles recorded by inspect from a JSON file
+
+Options:
+  --ip <IP>       Controller IP address, defaults to 10.5.5.100
+  --dry-run       Print the plan without connecting
+  -h, --help      Show this help
+
+rot arguments:
+  --joint <1-6>   Joint to rotate, from 1 to 6, defaults to 6
+  --deg <deg>     Rotation angle in degrees, negative reverses direction, defaults to 360
+  --speed <rad/s> Joint speed in radians per second, defaults to 0.8
+
+Log level:
+  Controlled by the RUST_LOG environment variable, defaults to info
+  RUST_LOG=debug jaka-cli status
+  RUST_LOG=error jaka-cli rot
+
+Ctrl+C:
+  Aborts any ongoing motion instead of killing the process. The robot stops
+  and the command exits cleanly. The robot stays powered and enabled after an abort.
+
+Examples:
+  jaka-cli status
+  jaka-cli power-on
+  jaka-cli rot --joint 1 --deg -360
+  jaka-cli rot --speed 3.14
+  jaka-cli inspect > pose.json
+  jaka-cli restore pose.json
+  jaka-cli --dry-run rot --joint 3
