@@ -6,11 +6,22 @@ fn main() {
 
     match target_os.as_str() {
         "linux" => {
-            let sdk_shared = "sdk/Linux/c&c++/x86_64-linux-gnu/shared";
-            println!("cargo:rustc-link-search=native={sdk_shared}");
-            // Runtime lookup via a relative rpath: the binary lives in
-            // target/<profile>/, the SDK is ../../sdk/... from there
-            println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../../{sdk_shared}");
+            let static_lib = "sdk/Linux/c&c++/x86_64-linux-gnu/static";
+            let shared_lib = "sdk/Linux/c&c++/x86_64-linux-gnu/shared";
+            // Prefer the static lib so the result is a single binary. Fall back
+            // to the shared lib with a relative rpath when the static lib is absent
+            if Path::new(static_lib).join("libjakaAPI.a").exists() {
+                println!("cargo:rustc-link-search=native={static_lib}");
+                println!("cargo:rustc-link-lib=static=jakaAPI");
+                // The SDK is C++ code, so pull in the C++ runtime
+                println!("cargo:rustc-link-lib=stdc++");
+                println!("cargo:rustc-link-lib=m");
+            } else {
+                println!("cargo:rustc-link-search=native={shared_lib}");
+                // Runtime lookup via a relative rpath: the binary lives in
+                // target/<profile>/, the SDK is ../../sdk/... from there
+                println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../../{shared_lib}");
+            }
         }
         "windows" => {
             let sdk_x64 = "sdk/Windows/c&c++/x64";
