@@ -87,35 +87,61 @@ unsafe extern "C" {
     ) -> errno_t;
 }
 
+// POSIX file descriptor helpers used to keep SDK printf output off stdout
+#[cfg(unix)]
+unsafe extern "C" {
+    fn dup(oldfd: i32) -> i32;
+    fn dup2(oldfd: i32, newfd: i32) -> i32;
+    fn write(fd: i32, buf: *const c_void, count: usize) -> isize;
+}
+
+// MSVCRT file descriptor helpers, the Windows counterpart of the above
+#[cfg(windows)]
+unsafe extern "system" {
+    fn _dup(oldfd: i32) -> i32;
+    fn _dup2(oldfd: i32, newfd: i32) -> i32;
+    fn _write(fd: i32, buf: *const c_void, count: u32) -> i32;
+}
+
 /// Redirect stdout to stderr and return the original stdout file descriptor.
 /// The SDK prints connection progress with printf at arbitrary times, so fd 1
 /// stays redirected for the whole session. Machine-readable output is written
 /// through the returned fd instead.
 pub fn redirect_stdout_to_stderr() -> i32 {
-    unsafe extern "C" {
-        fn dup(oldfd: i32) -> i32;
-        fn dup2(oldfd: i32, newfd: i32) -> i32;
-    }
+    #[cfg(unix)]
+    let saved = unsafe { dup(1) };
+    #[cfg(windows)]
+    let saved = unsafe { _dup(1) };
+    #[cfg(unix)]
     unsafe {
-        let saved = dup(1);
-        dup2(2, 1);
-        saved
-    }
+        dup2(2, 1)
+    };
+    #[cfg(windows)]
+    unsafe {
+        _dup2(2, 1)
+    };
+    saved
 }
 
 /// Write a string to a file descriptor, retrying on partial writes
 pub fn write_to_fd(fd: i32, s: &str) {
-    unsafe extern "C" {
-        fn write(fd: i32, buf: *const c_void, count: usize) -> isize;
-    }
     let bytes = s.as_bytes();
     let mut written = 0;
     while written < bytes.len() {
+        #[cfg(unix)]
         let n = unsafe {
             write(
                 fd,
                 bytes[written..].as_ptr() as *const c_void,
                 bytes.len() - written,
+            )
+        };
+        #[cfg(windows)]
+        let n = unsafe {
+            _write(
+                fd,
+                bytes[written..].as_ptr() as *const c_void,
+                (bytes.len() - written) as u32,
             )
         };
         if n <= 0 {
