@@ -47,4 +47,6 @@ Examples:
   jaka-cli move-to 100 0 0
   jaka-cli move-to 100 0 0 --rx 90
   jaka-cli move-to -50 0 400 --rel
+  jaka-cli inspect-pos > desk.json
+  jaka-cli move-to --pose desk.json
   jaka-cli --dry-run rot --joint 3

@@ -23,6 +23,13 @@ use cli::{Cli, Command};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 
+/// TCP pose document as written by inspect-pos
+#[derive(Deserialize)]
+struct PoseDoc {
+    head_pos: Vec<f64>,
+    head_rpy: Option<Vec<f64>>,
+}
+
 /// Joint angles document as recorded by inspect
 #[derive(Deserialize)]
 struct JointsDoc {
@@ -136,22 +143,35 @@ fn print_plan(args: &Cli, command: &Command) {
             ry,
             rz,
             rel,
+            pose,
         } => {
-            let mode = if *rel { "base + offset" } else { "absolute" };
-            info!(
-                "[dry-run] Will connect to controller {} and move the TCP to {mode} position ({x}, {y}, {z}) mm",
-                args.ip
-            );
-            let ori = match (rx, ry, rz) {
-                (None, None, None) => "keep current".to_string(),
-                _ => format!(
-                    "rx={}, ry={}, rz={} degrees",
-                    rx.unwrap_or(f64::NAN),
-                    ry.unwrap_or(f64::NAN),
-                    rz.unwrap_or(f64::NAN)
-                ),
-            };
-            info!("[dry-run] Orientation: {ori}");
+            if let Some(path) = pose {
+                info!(
+                    "[dry-run] Will connect to controller {} and move the TCP to the pose from {}",
+                    args.ip,
+                    path.display()
+                );
+            } else {
+                let (Some(x), Some(y), Some(z)) = (x, y, z) else {
+                    error!("x, y, z are required unless --pose is given");
+                    return;
+                };
+                let mode = if *rel { "base + offset" } else { "absolute" };
+                info!(
+                    "[dry-run] Will connect to controller {} and move the TCP to {mode} position ({x}, {y}, {z}) mm",
+                    args.ip
+                );
+                let ori = match (rx, ry, rz) {
+                    (None, None, None) => "keep current".to_string(),
+                    _ => format!(
+                        "rx={}, ry={}, rz={} degrees",
+                        rx.unwrap_or(f64::NAN),
+                        ry.unwrap_or(f64::NAN),
+                        rz.unwrap_or(f64::NAN)
+                    ),
+                };
+                info!("[dry-run] Orientation: {ori}");
+            }
             info!("[dry-run] Linear speed {speed:.0} mm/s, out-of-workspace targets get clamped");
         }
         Command::SetBase => info!(
@@ -270,7 +290,28 @@ async fn drive(handle: &JKHD, command: &Command, stdout_fd: i32) -> Result<(), S
                     ry,
                     rz,
                     rel,
-                } => move_to(handle, *x, *y, *z, *speed, *rx, *ry, *rz, *rel).await,
+                    pose,
+                } => {
+                    if pose.is_some() {
+                        return move_to(
+                            handle,
+                            0.0,
+                            0.0,
+                            0.0,
+                            *speed,
+                            *rx,
+                            *ry,
+                            *rz,
+                            *rel,
+                            pose.as_deref(),
+                        )
+                        .await;
+                    }
+                    let (Some(x), Some(y), Some(z)) = (x, y, z) else {
+                        return Err("x, y, z are required unless --pose is given".into());
+                    };
+                    move_to(handle, *x, *y, *z, *speed, *rx, *ry, *rz, *rel, None).await
+                }
                 _ => Ok(()),
             }
         }
@@ -504,12 +545,43 @@ async fn move_to(
     ry: Option<f64>,
     rz: Option<f64>,
     rel: bool,
+    pose: Option<&Path>,
 ) -> Result<(), String> {
     // The current TCP pose provides the orientation unless overridden
     let mut cur = CartesianPose::zero();
     check("Read TCP position", unsafe {
         binding::get_tcp_position(handle, &mut cur)
     })?;
+
+    // A pose file from inspect-pos overrides position and orientation
+    let (tx, ty, tz, trx, try_, trz) = if let Some(path) = pose {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+        let doc: PoseDoc = serde_json::from_str(&text)
+            .map_err(|e| format!("Invalid pose JSON in {}: {e}", path.display()))?;
+        if doc.head_pos.len() != 3 {
+            return Err(format!(
+                "head_pos must have 3 values, got {}",
+                doc.head_pos.len()
+            ));
+        }
+        let rpy = doc.head_rpy.as_deref().unwrap_or(&[]);
+        let (trx, try_, trz) = if rpy.len() == 3 {
+            (Some(rpy[0]), Some(rpy[1]), Some(rpy[2]))
+        } else {
+            (None, None, None)
+        };
+        (
+            doc.head_pos[0],
+            doc.head_pos[1],
+            doc.head_pos[2],
+            trx,
+            try_,
+            trz,
+        )
+    } else {
+        (x, y, z, rx, ry, rz)
+    };
 
     let mut target = CartesianPose::zero();
     if rel {
@@ -526,22 +598,21 @@ async fn move_to(
                 base.tran.x, base.tran.y, base.tran.z
             );
         }
-        target.tran.x = base.tran.x + x;
-        target.tran.y = base.tran.y + y;
-        target.tran.z = base.tran.z + z;
+        target.tran.x = base.tran.x + tx;
+        target.tran.y = base.tran.y + ty;
+        target.tran.z = base.tran.z + tz;
     } else {
         // Absolute mode: x y z are base-frame coordinates, the base pose is unused
-        target.tran.x = x;
-        target.tran.y = y;
-        target.tran.z = z;
-        info!("Absolute target in the base frame, the saved base pose is unused");
+        target.tran.x = tx;
+        target.tran.y = ty;
+        target.tran.z = tz;
     }
 
     // Orientation comes from the explicit angles when given, otherwise the
     // current one is kept
-    target.rpy.rx = rx.map(|v| v.to_radians()).unwrap_or(cur.rpy.rx);
-    target.rpy.ry = ry.map(|v| v.to_radians()).unwrap_or(cur.rpy.ry);
-    target.rpy.rz = rz.map(|v| v.to_radians()).unwrap_or(cur.rpy.rz);
+    target.rpy.rx = trx.map(|v| v.to_radians()).unwrap_or(cur.rpy.rx);
+    target.rpy.ry = try_.map(|v| v.to_radians()).unwrap_or(cur.rpy.ry);
+    target.rpy.rz = trz.map(|v| v.to_radians()).unwrap_or(cur.rpy.rz);
 
     // Current joints are the IK reference to pick the nearest solution
     let mut ref_joint = JointValue::zero();
@@ -570,7 +641,7 @@ async fn move_to(
 
     info!("Moving linearly at {speed:.0} mm/s");
     let h = *handle;
-    run_blocking_motion(handle, move || unsafe {
+    let linear_result = run_blocking_motion(handle, move || unsafe {
         binding::linear_move_extend(
             &h,
             &goal,
@@ -582,17 +653,65 @@ async fn move_to(
             std::ptr::null::<OptionalCond>(),
         )
     })
-    .await?;
+    .await;
 
-    // Read the final TCP position
+    // A straight path can fail midway when a point on the line has no IK
+    // solution. Fall back to a joint move, which only needs the end point to
+    // be reachable, so the robot always gets to the target
+    if let Err(e) = linear_result {
+        warn!("Linear move failed: {e}. Falling back to a joint move");
+        let mut joint = JointValue::zero();
+        let ret = unsafe { binding::kine_inverse(handle, &ref_joint, &goal, &mut joint) };
+        if ret != binding::ERR_SUCC {
+            return Err("Joint fallback failed, the target has no IK solution".into());
+        }
+        if !joint_ok(&joint) {
+            return Err(format!(
+                "Target is unreachable with the current orientation, IK solution {} exceeds the joint limits",
+                format_joints(&joint)
+            ));
+        }
+        let h2 = *handle;
+        let fallback_result = run_blocking_motion(handle, move || unsafe {
+            binding::joint_move_extend(
+                &h2,
+                &joint,
+                MoveMode::Abs,
+                1,   // is_block: block until the motion completes
+                1.5, // rad/s
+                1.0, // acc, rad/s^2
+                0.0, // tol
+                std::ptr::null::<OptionalCond>(),
+            )
+        })
+        .await;
+        if let Err(e) = fallback_result {
+            warn!("Joint fallback move failed: {e}");
+            info!(
+                "Fallback joint solution in degrees: {}",
+                format_joints(&joint)
+            );
+            return Err(e);
+        }
+    }
+
+    // Read the final TCP position and report the accuracy
     let mut fin = CartesianPose::zero();
     check("Read final TCP position", unsafe {
         binding::get_tcp_position(handle, &mut fin)
     })?;
+    let err = ((fin.tran.x - goal.tran.x).powi(2)
+        + (fin.tran.y - goal.tran.y).powi(2)
+        + (fin.tran.z - goal.tran.z).powi(2))
+    .sqrt();
     info!(
         "Final TCP in mm: x={:.1}, y={:.1}, z={:.1}",
         fin.tran.x, fin.tran.y, fin.tran.z
     );
+    info!("Position error: {err:.2} mm");
+    if err > 2.0 {
+        warn!("Large position error, check the robot");
+    }
     info!("Done. Reached the target");
     Ok(())
 }
@@ -694,8 +813,24 @@ fn resolve_with_clamp(
     Ok((goal, true))
 }
 
+/// Check an IK solution against the JAKA joint travel limits in degrees
+fn joint_ok(j: &JointValue) -> bool {
+    const LIMITS: [(f64, f64); 6] = [
+        (-360.0, 360.0), // J1
+        (-130.0, 130.0), // J2
+        (-360.0, 360.0), // J3
+        (-360.0, 360.0), // J4
+        (-130.0, 130.0), // J5
+        (-360.0, 360.0), // J6
+    ];
+    j.j_val.iter().zip(LIMITS.iter()).all(|(v, (lo, hi))| {
+        let deg = v.to_degrees();
+        deg >= *lo && deg <= *hi
+    })
+}
+
 /// Check that every sample along the straight path from from to to has a valid
-/// inverse kinematics solution
+/// inverse kinematics solution within the joint limits
 fn path_clear(
     handle: &JKHD,
     from: &CartesianPose,
@@ -708,7 +843,7 @@ fn path_clear(
         let probe = lerp_pose(*from, *to, t);
         let mut joint = JointValue::zero();
         let ret = unsafe { binding::kine_inverse(handle, ref_joint, &probe, &mut joint) };
-        if ret != binding::ERR_SUCC {
+        if ret != binding::ERR_SUCC || !joint_ok(&joint) {
             return false;
         }
     }
@@ -752,11 +887,16 @@ fn format_joints(j: &JointValue) -> String {
         .join(", ")
 }
 
-/// Print the TCP position relative to the base frame as a JSON object on the
-/// original stdout. Positions are in mm, the base frame origin is [0,0,0]
+/// Print the TCP pose relative to the base frame as a JSON object on the
+/// original stdout. Positions are in mm, orientations in degrees
 fn print_head_pos_json(fd: i32, pose: &CartesianPose) {
     let json = serde_json::json!({
         "head_pos": [pose.tran.x, pose.tran.y, pose.tran.z],
+        "head_rpy": [
+            pose.rpy.rx.to_degrees(),
+            pose.rpy.ry.to_degrees(),
+            pose.rpy.rz.to_degrees(),
+        ],
         "base_pos": [0.0, 0.0, 0.0],
     });
     binding::write_to_fd(fd, &format!("{json}\n"));

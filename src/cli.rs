@@ -101,15 +101,15 @@ pub enum Command {
     MoveTo {
         /// X coordinate in mm in the base frame
         #[arg(value_name = "X", allow_negative_numbers = true)]
-        x: f64,
+        x: Option<f64>,
 
         /// Y coordinate in mm in the base frame
         #[arg(value_name = "Y", allow_negative_numbers = true)]
-        y: f64,
+        y: Option<f64>,
 
         /// Z coordinate in mm in the base frame
         #[arg(value_name = "Z", allow_negative_numbers = true)]
-        z: f64,
+        z: Option<f64>,
 
         /// Linear speed in mm/s
         #[arg(long, default_value_t = 100.0)]
@@ -118,6 +118,10 @@ pub enum Command {
         /// Treat x y z as offsets from the base pose instead of absolute coordinates
         #[arg(long)]
         rel: bool,
+
+        /// Read the absolute target pose from an inspect-pos JSON file, position and orientation together
+        #[arg(long, value_name = "POSE_FILE", conflicts_with_all = ["x", "y", "z"])]
+        pose: Option<PathBuf>,
 
         /// Target roll in degrees in the base frame, keep current when omitted
         #[arg(long, allow_negative_numbers = true)]
