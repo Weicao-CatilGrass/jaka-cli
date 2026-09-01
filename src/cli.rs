@@ -89,18 +89,19 @@ pub enum Command {
         speed: f64,
     },
 
-    /// Move the TCP by a relative xyz offset in mm from the current position
+    /// Move the TCP to a fixed target: base pose plus an xyz offset in mm.
+    /// Repeating the same command is a no-op once the robot is already there
     #[command(disable_help_flag = true)]
     MoveTo {
-        /// X offset in mm, relative to the current TCP position
+        /// X offset in mm relative to the base pose
         #[arg(value_name = "X", allow_negative_numbers = true)]
         x: f64,
 
-        /// Y offset in mm, relative to the current TCP position
+        /// Y offset in mm relative to the base pose
         #[arg(value_name = "Y", allow_negative_numbers = true)]
         y: f64,
 
-        /// Z offset in mm, relative to the current TCP position
+        /// Z offset in mm relative to the base pose
         #[arg(value_name = "Z", allow_negative_numbers = true)]
         z: f64,
 
@@ -108,4 +109,8 @@ pub enum Command {
         #[arg(long, default_value_t = 100.0)]
         speed: f64,
     },
+
+    /// Save the current TCP position as the base pose for move-to
+    #[command(disable_help_flag = true)]
+    SetBase,
 }

@@ -122,6 +122,12 @@ unsafe extern "C" {
         cartesian_pose: *const CartesianPose,
         joint_pos: *mut JointValue,
     ) -> errno_t;
+    /// Forward kinematics
+    pub fn kine_forward(
+        handle: *const JKHD,
+        joint_pos: *const JointValue,
+        cartesian_pose: *mut CartesianPose,
+    ) -> errno_t;
     pub fn linear_move_extend(
         handle: *const JKHD,
         end_pos: *const CartesianPose,

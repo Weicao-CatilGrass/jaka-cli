@@ -21,12 +21,23 @@ use binding::{
 use clap::Parser;
 use cli::{Cli, Command};
 use log::{error, info, warn};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Joint angles document as recorded by inspect
 #[derive(Deserialize)]
 struct JointsDoc {
     joints: Vec<f64>,
+}
+
+/// Base pose file written by set-base, read by move-to
+const BASE_FILE: &str = ".jaka-cli-base.json";
+
+/// Base pose document, xyz in mm
+#[derive(Serialize, Deserialize)]
+struct BaseDoc {
+    x: f64,
+    y: f64,
+    z: f64,
 }
 
 #[tokio::main]
@@ -45,7 +56,7 @@ async fn main() -> ExitCode {
 
     let Some(command) = &args.command else {
         error!(
-            "No subcommand given. Expected one of status, power-on, power-off, estop-clear, inspect, dh, rot, restore, move-to. Use --help for usage"
+            "No subcommand given. Expected one of status, power-on, power-off, estop-clear, inspect, dh, set-base, rot, restore, move-to. Use --help for usage"
         );
         return ExitCode::FAILURE;
     };
@@ -111,11 +122,15 @@ fn print_plan(args: &Cli, command: &Command) {
         }
         Command::MoveTo { x, y, z, speed } => {
             info!(
-                "[dry-run] Will connect to controller {} and move the TCP by ({x}, {y}, {z}) mm",
+                "[dry-run] Will connect to controller {} and move the TCP to base + ({x}, {y}, {z}) mm",
                 args.ip
             );
             info!("[dry-run] Linear speed {speed:.0} mm/s, out-of-workspace targets get clamped");
         }
+        Command::SetBase => info!(
+            "[dry-run] Will connect to controller {} and save the current TCP as the base pose",
+            args.ip
+        ),
     }
 }
 
@@ -161,6 +176,7 @@ async fn drive(handle: &JKHD, command: &Command, stdout_fd: i32) -> Result<(), S
             Ok(())
         }
         Command::EstopClear => estop_clear(handle),
+        Command::SetBase => set_base(handle),
         Command::Inspect => {
             let mut cur = JointValue::zero();
             check("Read joint position", unsafe {
@@ -406,24 +422,37 @@ async fn run_blocking_motion(
     outcome
 }
 
-/// Move the TCP by a relative xyz offset in mm from the current position.
-/// Targets outside the workspace are clamped to the nearest reachable point
+/// Move the TCP to a fixed target: the base pose plus an xyz offset in mm.
+/// The base pose is either the robot home position or the one saved by
+/// set-base. Targets outside the workspace are clamped to the nearest
+/// reachable point. Repeating the same command is a no-op once in position
 async fn move_to(handle: &JKHD, x: f64, y: f64, z: f64, speed: f64) -> Result<(), String> {
-    // The current TCP pose is the reference position
+    // The current TCP pose provides the orientation, which is kept unchanged
     let mut cur = CartesianPose::zero();
     check("Read TCP position", unsafe {
         binding::get_tcp_position(handle, &mut cur)
     })?;
-    info!(
-        "Current TCP in mm: x={:.1}, y={:.1}, z={:.1}",
-        cur.tran.x, cur.tran.y, cur.tran.z
-    );
 
-    // Target is the current pose plus the offset, orientation unchanged
-    let mut target = cur;
+    // Resolve the base pose: the saved one if present, otherwise home
+    let (base, from_file) = load_base(handle)?;
+    if from_file {
+        info!(
+            "Base pose from {} in mm: x={:.1}, y={:.1}, z={:.1}",
+            BASE_FILE, base.tran.x, base.tran.y, base.tran.z
+        );
+    } else {
+        info!(
+            "Base pose is the robot home in mm: x={:.1}, y={:.1}, z={:.1}",
+            base.tran.x, base.tran.y, base.tran.z
+        );
+    }
+
+    // Target is the base pose plus the offset, current orientation kept
+    let mut target = base;
     target.tran.x += x;
     target.tran.y += y;
     target.tran.z += z;
+    target.rpy = cur.rpy;
 
     // Current joints are the IK reference to pick the nearest solution
     let mut ref_joint = JointValue::zero();
@@ -467,6 +496,66 @@ async fn move_to(handle: &JKHD, x: f64, y: f64, z: f64, speed: f64) -> Result<()
     );
     info!("Done. Reached the target");
     Ok(())
+}
+
+/// Save the current TCP position as the base pose for move-to
+fn set_base(handle: &JKHD) -> Result<(), String> {
+    let mut cur = CartesianPose::zero();
+    check("Read TCP position", unsafe {
+        binding::get_tcp_position(handle, &mut cur)
+    })?;
+
+    let doc = BaseDoc {
+        x: cur.tran.x,
+        y: cur.tran.y,
+        z: cur.tran.z,
+    };
+    let text = serde_json::to_string_pretty(&doc)
+        .map_err(|e| format!("Serialize base pose failed: {e}"))?;
+    let path = base_file_path();
+    std::fs::write(&path, text).map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
+    info!(
+        "Base pose saved to {} in mm: x={:.1}, y={:.1}, z={:.1}",
+        path.display(),
+        cur.tran.x,
+        cur.tran.y,
+        cur.tran.z
+    );
+    Ok(())
+}
+
+/// Load the base pose: the saved file if present, otherwise the robot home
+/// position computed with forward kinematics at zero joints
+fn load_base(handle: &JKHD) -> Result<(CartesianPose, bool), String> {
+    let path = base_file_path();
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        if let Ok(doc) = serde_json::from_str::<BaseDoc>(&text) {
+            let mut base = CartesianPose::zero();
+            base.tran.x = doc.x;
+            base.tran.y = doc.y;
+            base.tran.z = doc.z;
+            return Ok((base, true));
+        }
+        warn!(
+            "{} is invalid, falling back to the robot home",
+            path.display()
+        );
+    }
+
+    // Robot home: forward kinematics at zero joints
+    let zero = JointValue::zero();
+    let mut home = CartesianPose::zero();
+    check("Compute home pose", unsafe {
+        binding::kine_forward(handle, &zero, &mut home)
+    })?;
+    Ok((home, false))
+}
+
+fn base_file_path() -> std::path::PathBuf {
+    std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join(BASE_FILE)
 }
 
 /// Inverse kinematics with clamping. When the target is unreachable, binary
