@@ -135,9 +135,11 @@ fn print_plan(args: &Cli, command: &Command) {
             rx,
             ry,
             rz,
+            rel,
         } => {
+            let mode = if *rel { "base + offset" } else { "absolute" };
             info!(
-                "[dry-run] Will connect to controller {} and move the TCP to base + ({x}, {y}, {z}) mm",
+                "[dry-run] Will connect to controller {} and move the TCP to {mode} position ({x}, {y}, {z}) mm",
                 args.ip
             );
             let ori = match (rx, ry, rz) {
@@ -267,7 +269,8 @@ async fn drive(handle: &JKHD, command: &Command, stdout_fd: i32) -> Result<(), S
                     rx,
                     ry,
                     rz,
-                } => move_to(handle, *x, *y, *z, *speed, *rx, *ry, *rz).await,
+                    rel,
+                } => move_to(handle, *x, *y, *z, *speed, *rx, *ry, *rz, *rel).await,
                 _ => Ok(()),
             }
         }
@@ -486,11 +489,11 @@ fn clamp_joint_speed(speed: f64) -> f64 {
     }
 }
 
-/// Move the TCP to a fixed target: the base pose plus an xyz offset in mm.
-/// Orientation is either the current one or the explicit rx/ry/rz in degrees.
-/// The base pose is either the robot home position or the one saved by
-/// set-base. Targets outside the workspace are clamped to the nearest
-/// reachable point. Repeating the same command is a no-op once in position
+/// Move the TCP to an absolute base-frame position, or with rel=true to a
+/// position relative to the base pose. Orientation is either the current one
+/// or the explicit rx/ry/rz in degrees. Targets outside the workspace are
+/// clamped to the nearest reachable point. Repeating the same command is a
+/// no-op once in position
 async fn move_to(
     handle: &JKHD,
     x: f64,
@@ -500,33 +503,42 @@ async fn move_to(
     rx: Option<f64>,
     ry: Option<f64>,
     rz: Option<f64>,
+    rel: bool,
 ) -> Result<(), String> {
-    // The current TCP pose provides the orientation, which is kept unchanged
+    // The current TCP pose provides the orientation unless overridden
     let mut cur = CartesianPose::zero();
     check("Read TCP position", unsafe {
         binding::get_tcp_position(handle, &mut cur)
     })?;
 
-    // Resolve the base pose: the saved one if present, otherwise home
-    let (base, from_file) = load_base(handle)?;
-    if from_file {
-        info!(
-            "Base pose from {} in mm: x={:.1}, y={:.1}, z={:.1}",
-            BASE_FILE, base.tran.x, base.tran.y, base.tran.z
-        );
+    let mut target = CartesianPose::zero();
+    if rel {
+        // Relative mode: the base pose plus the offset
+        let (base, from_file) = load_base(handle)?;
+        if from_file {
+            info!(
+                "Base pose from {} in mm: x={:.1}, y={:.1}, z={:.1}",
+                BASE_FILE, base.tran.x, base.tran.y, base.tran.z
+            );
+        } else {
+            info!(
+                "Base pose is the robot home in mm: x={:.1}, y={:.1}, z={:.1}",
+                base.tran.x, base.tran.y, base.tran.z
+            );
+        }
+        target.tran.x = base.tran.x + x;
+        target.tran.y = base.tran.y + y;
+        target.tran.z = base.tran.z + z;
     } else {
-        info!(
-            "Base pose is the robot home in mm: x={:.1}, y={:.1}, z={:.1}",
-            base.tran.x, base.tran.y, base.tran.z
-        );
+        // Absolute mode: x y z are base-frame coordinates, the base pose is unused
+        target.tran.x = x;
+        target.tran.y = y;
+        target.tran.z = z;
+        info!("Absolute target in the base frame, the saved base pose is unused");
     }
 
-    // Target is the base pose plus the offset. Orientation comes from the
-    // explicit angles when given, otherwise the current one is kept
-    let mut target = base;
-    target.tran.x += x;
-    target.tran.y += y;
-    target.tran.z += z;
+    // Orientation comes from the explicit angles when given, otherwise the
+    // current one is kept
     target.rpy.rx = rx.map(|v| v.to_radians()).unwrap_or(cur.rpy.rx);
     target.rpy.ry = ry.map(|v| v.to_radians()).unwrap_or(cur.rpy.ry);
     target.rpy.rz = rz.map(|v| v.to_radians()).unwrap_or(cur.rpy.rz);

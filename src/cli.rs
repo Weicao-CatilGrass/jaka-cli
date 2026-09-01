@@ -94,25 +94,30 @@ pub enum Command {
         speed: f64,
     },
 
-    /// Move the TCP to a fixed target: base pose plus an xyz offset in mm.
-    /// Repeating the same command is a no-op once the robot is already there
+    /// Move the TCP to an absolute base-frame position, or with --rel to a
+    /// position relative to the base pose. Repeating the same command is a
+    /// no-op once the robot is already there
     #[command(disable_help_flag = true)]
     MoveTo {
-        /// X offset in mm relative to the base pose
+        /// X coordinate in mm in the base frame
         #[arg(value_name = "X", allow_negative_numbers = true)]
         x: f64,
 
-        /// Y offset in mm relative to the base pose
+        /// Y coordinate in mm in the base frame
         #[arg(value_name = "Y", allow_negative_numbers = true)]
         y: f64,
 
-        /// Z offset in mm relative to the base pose
+        /// Z coordinate in mm in the base frame
         #[arg(value_name = "Z", allow_negative_numbers = true)]
         z: f64,
 
         /// Linear speed in mm/s
         #[arg(long, default_value_t = 100.0)]
         speed: f64,
+
+        /// Treat x y z as offsets from the base pose instead of absolute coordinates
+        #[arg(long)]
+        rel: bool,
 
         /// Target roll in degrees in the base frame, keep current when omitted
         #[arg(long, allow_negative_numbers = true)]
