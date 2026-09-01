@@ -614,13 +614,21 @@ async fn move_to(
     target.rpy.ry = try_.map(|v| v.to_radians()).unwrap_or(cur.rpy.ry);
     target.rpy.rz = trz.map(|v| v.to_radians()).unwrap_or(cur.rpy.rz);
 
+    // A large orientation change makes the interpolated straight path
+    // unreachable almost always, so a joint move is used instead. The joint
+    // path does not constrain the TCP, only the end pose must be reachable
+    let big_ori_change = |a: f64, b: f64| (a - b).abs() > 30.0_f64.to_radians();
+    let ori_jump = big_ori_change(cur.rpy.rx, target.rpy.rx)
+        || big_ori_change(cur.rpy.ry, target.rpy.ry)
+        || big_ori_change(cur.rpy.rz, target.rpy.rz);
+
     // Current joints are the IK reference to pick the nearest solution
     let mut ref_joint = JointValue::zero();
     check("Read joint position", unsafe {
         binding::get_joint_position(handle, &mut ref_joint)
     })?;
 
-    let (goal, clamped) = resolve_with_clamp(handle, cur, target, &ref_joint)?;
+    let (goal, clamped) = resolve_with_clamp(handle, cur, target, &ref_joint, ori_jump)?;
     if clamped {
         // The clamped point is the current position, so the robot is already
         // at the workspace boundary and there is nothing to move
@@ -641,36 +649,35 @@ async fn move_to(
 
     info!("Moving linearly at {speed:.0} mm/s");
     let h = *handle;
-    let linear_result = run_blocking_motion(handle, move || unsafe {
-        binding::linear_move_extend(
-            &h,
-            &goal,
-            MoveMode::Abs,
-            1, // is_block: block until the motion completes
-            speed,
-            500.0, // acc, mm/s^2
-            0.0,   // tol
-            std::ptr::null::<OptionalCond>(),
-        )
-    })
-    .await;
+    let linear_result = if ori_jump {
+        info!("Large orientation change, using a joint move");
+        Err("skipped".to_string())
+    } else {
+        run_blocking_motion(handle, move || unsafe {
+            binding::linear_move_extend(
+                &h,
+                &goal,
+                MoveMode::Abs,
+                1, // is_block: block until the motion completes
+                speed,
+                500.0, // acc, mm/s^2
+                0.0,   // tol
+                std::ptr::null::<OptionalCond>(),
+            )
+        })
+        .await
+    };
 
     // A straight path can fail midway when a point on the line has no IK
     // solution. Fall back to a joint move, which only needs the end point to
     // be reachable, so the robot always gets to the target
     if let Err(e) = linear_result {
-        warn!("Linear move failed: {e}. Falling back to a joint move");
-        let mut joint = JointValue::zero();
-        let ret = unsafe { binding::kine_inverse(handle, &ref_joint, &goal, &mut joint) };
-        if ret != binding::ERR_SUCC {
+        if !ori_jump {
+            warn!("Linear move failed: {e}. Falling back to a joint move");
+        }
+        let Some(joint) = ik_solve(handle, &ref_joint, &goal) else {
             return Err("Joint fallback failed, the target has no IK solution".into());
-        }
-        if !joint_ok(&joint) {
-            return Err(format!(
-                "Target is unreachable with the current orientation, IK solution {} exceeds the joint limits",
-                format_joints(&joint)
-            ));
-        }
+        };
         let h2 = *handle;
         let fallback_result = run_blocking_motion(handle, move || unsafe {
             binding::joint_move_extend(
@@ -786,18 +793,21 @@ fn resolve_with_clamp(
     cur: CartesianPose,
     target: CartesianPose,
     ref_joint: &JointValue,
+    fixed_ori: bool,
 ) -> Result<(CartesianPose, bool), String> {
-    if path_clear(handle, &cur, &target, ref_joint) {
+    if path_clear(handle, &cur, &target, ref_joint, fixed_ori) {
         return Ok((target, false));
     }
 
-    // lo is always reachable, hi is not
+    // lo is always reachable, hi is not. The orientation is interpolated
+    // along the line instead of forcing the target one, a pose near the
+    // current position usually cannot hold the target orientation
     let mut lo = 0.0_f64;
     let mut hi = 1.0_f64;
     for _ in 0..20 {
         let mid = (lo + hi) / 2.0;
         let probe = lerp_pose(cur, target, mid);
-        if path_clear(handle, &cur, &probe, ref_joint) {
+        if path_clear(handle, &cur, &probe, ref_joint, fixed_ori) {
             lo = mid;
         } else {
             hi = mid;
@@ -813,14 +823,14 @@ fn resolve_with_clamp(
     Ok((goal, true))
 }
 
-/// Check an IK solution against the JAKA joint travel limits in degrees
+/// Check an IK solution against the JAKA Mini joint travel limits in degrees
 fn joint_ok(j: &JointValue) -> bool {
     const LIMITS: [(f64, f64); 6] = [
         (-360.0, 360.0), // J1
-        (-130.0, 130.0), // J2
+        (-120.0, 120.0), // J2, JAKA Mini
         (-360.0, 360.0), // J3
         (-360.0, 360.0), // J4
-        (-130.0, 130.0), // J5
+        (-120.0, 120.0), // J5, JAKA Mini
         (-360.0, 360.0), // J6
     ];
     j.j_val.iter().zip(LIMITS.iter()).all(|(v, (lo, hi))| {
@@ -829,21 +839,55 @@ fn joint_ok(j: &JointValue) -> bool {
     })
 }
 
-/// Check that every sample along the straight path from from to to has a valid
-/// inverse kinematics solution within the joint limits
+/// Run the SDK IK solver from several reference joints and return the first
+/// solution within the joint limits. The solver is reference-dependent and
+/// can fail or return out-of-limit solutions when the reference is far from
+/// the target, so multiple starting points are tried
+fn ik_solve(handle: &JKHD, current: &JointValue, pose: &CartesianPose) -> Option<JointValue> {
+    let refs = [*current, JointValue::zero(), home_joints()];
+    let mut joint = JointValue::zero();
+    for r in refs {
+        let ret = unsafe { binding::kine_inverse(handle, &r, pose, &mut joint) };
+        if ret == binding::ERR_SUCC && joint_ok(&joint) {
+            return Some(joint);
+        }
+    }
+    None
+}
+
+/// The default home pose in radians, used as an IK reference
+fn home_joints() -> JointValue {
+    let mut j = JointValue::zero();
+    j.j_val[1] = std::f64::consts::FRAC_PI_2; // J2: 90 deg
+    j.j_val[2] = -std::f64::consts::FRAC_PI_2; // J3: -90 deg
+    j.j_val[4] = -std::f64::consts::FRAC_PI_2; // J5: -90 deg
+    j
+}
+
+/// Check that the path from from to to is feasible. For a linear move every
+/// sample along the straight line must have an IK solution, since the TCP
+/// passes through all of them. For a joint move (fixed_ori) only the end pose
+/// matters, the joint path is not constrained by the TCP
 fn path_clear(
     handle: &JKHD,
     from: &CartesianPose,
     to: &CartesianPose,
     ref_joint: &JointValue,
+    fixed_ori: bool,
 ) -> bool {
     const SAMPLES: usize = 8;
     for i in 0..=SAMPLES {
         let t = i as f64 / SAMPLES as f64;
-        let probe = lerp_pose(*from, *to, t);
-        let mut joint = JointValue::zero();
-        let ret = unsafe { binding::kine_inverse(handle, ref_joint, &probe, &mut joint) };
-        if ret != binding::ERR_SUCC || !joint_ok(&joint) {
+        let mut probe = lerp_pose(*from, *to, t);
+        if fixed_ori {
+            probe.rpy = to.rpy;
+            // Only the end pose is checked for a joint move, skip the
+            // intermediate samples
+            if i < SAMPLES {
+                continue;
+            }
+        }
+        if ik_solve(handle, ref_joint, &probe).is_none() {
             return false;
         }
     }
