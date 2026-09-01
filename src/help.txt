@@ -12,6 +12,7 @@ Commands:
   dh          Print the DH parameters as JSON to stdout
   rot         Power on, enable, then rotate the specified joint
   restore     Restore the joint angles recorded by inspect from a JSON file
+  move-to     Move the TCP by a relative xyz offset in mm, clamped to the workspace
 
 Options:
   --ip <IP>       Controller IP address, defaults to 10.5.5.100
@@ -39,4 +40,5 @@ Examples:
   jaka-cli rot --speed 3.14
   jaka-cli inspect > pose.json
   jaka-cli restore pose.json
+  jaka-cli move-to 100 0 0
   jaka-cli --dry-run rot --joint 3

@@ -34,6 +34,38 @@ impl JointValue {
     }
 }
 
+/// Cartesian translation in mm (jktypes.h: CartesianTran)
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CartesianTran {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+}
+
+/// Cartesian orientation as RPY in radians (jktypes.h: Rpy)
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Rpy {
+    pub rx: f64,
+    pub ry: f64,
+    pub rz: f64,
+}
+
+/// Cartesian pose, translation in mm and orientation in radians (jktypes.h: CartesianPose)
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CartesianPose {
+    pub tran: CartesianTran,
+    pub rpy: Rpy,
+}
+
+impl CartesianPose {
+    pub fn zero() -> Self {
+        Self::default()
+    }
+}
+
 /// Simplified robot state (jktypes.h: RobotState)
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -82,6 +114,24 @@ unsafe extern "C" {
     pub fn get_robot_state(handle: *const JKHD, state: *mut RobotState) -> errno_t;
     pub fn get_dh_param(handle: *const JKHD, dh_param: *mut DHParam) -> errno_t;
     pub fn get_joint_position(handle: *const JKHD, pos: *mut JointValue) -> errno_t;
+    pub fn get_tcp_position(handle: *const JKHD, tcp_position: *mut CartesianPose) -> errno_t;
+    /// Inverse kinematics with a reference joint pose to disambiguate solutions
+    pub fn kine_inverse(
+        handle: *const JKHD,
+        ref_pos: *const JointValue,
+        cartesian_pose: *const CartesianPose,
+        joint_pos: *mut JointValue,
+    ) -> errno_t;
+    pub fn linear_move_extend(
+        handle: *const JKHD,
+        end_pos: *const CartesianPose,
+        move_mode: MoveMode,
+        is_block: BOOL,
+        speed: f64,
+        acc: f64,
+        tol: f64,
+        option_cond: *const OptionalCond,
+    ) -> errno_t;
     pub fn is_in_estop(handle: *const JKHD, in_estop: *mut BOOL) -> errno_t;
     pub fn clear_error(handle: *const JKHD) -> errno_t;
     /// Stop all ongoing movements of the cobot

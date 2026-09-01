@@ -14,7 +14,10 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use binding::{BOOL, DHParam, JKHD, JointValue, MoveMode, OptionalCond, RobotState, check};
+use binding::{
+    BOOL, CartesianPose, DHParam, JKHD, JointValue, MoveMode, OptionalCond, RobotState, check,
+    errno_t,
+};
 use clap::Parser;
 use cli::{Cli, Command};
 use log::{error, info, warn};
@@ -42,7 +45,7 @@ async fn main() -> ExitCode {
 
     let Some(command) = &args.command else {
         error!(
-            "No subcommand given. Expected one of status, power-on, power-off, estop-clear, inspect, dh, rot, restore. Use --help for usage"
+            "No subcommand given. Expected one of status, power-on, power-off, estop-clear, inspect, dh, rot, restore, move-to. Use --help for usage"
         );
         return ExitCode::FAILURE;
     };
@@ -105,6 +108,13 @@ fn print_plan(args: &Cli, command: &Command) {
                 file.display()
             );
             info!("[dry-run] Speed {:.2} rad/s", speed);
+        }
+        Command::MoveTo { x, y, z, speed } => {
+            info!(
+                "[dry-run] Will connect to controller {} and move the TCP by ({x}, {y}, {z}) mm",
+                args.ip
+            );
+            info!("[dry-run] Linear speed {speed:.0} mm/s, out-of-workspace targets get clamped");
         }
     }
 }
@@ -187,7 +197,10 @@ async fn drive(handle: &JKHD, command: &Command, stdout_fd: i32) -> Result<(), S
             }
             Ok(())
         }
-        Command::PowerOn | Command::Rot { .. } | Command::Restore { .. } => {
+        Command::PowerOn
+        | Command::Rot { .. }
+        | Command::Restore { .. }
+        | Command::MoveTo { .. } => {
             if st.estoped != 0 {
                 return Err(
                     "E-stop is pressed. Release the button physically, then run estop-clear".into(),
@@ -197,6 +210,7 @@ async fn drive(handle: &JKHD, command: &Command, stdout_fd: i32) -> Result<(), S
             match command {
                 Command::Rot { joint, deg, speed } => rot(handle, *joint, *deg, *speed).await,
                 Command::Restore { file, speed } => restore(handle, file, *speed).await,
+                Command::MoveTo { x, y, z, speed } => move_to(handle, *x, *y, *z, *speed).await,
                 _ => Ok(()),
             }
         }
@@ -274,7 +288,20 @@ async fn rot(handle: &JKHD, joint: i32, deg: f64, speed: f64) -> Result<(), Stri
         joint, deg, speed
     );
 
-    run_blocking_move(handle, target, MoveMode::Incr, speed).await?;
+    let h = *handle;
+    run_blocking_motion(handle, move || unsafe {
+        binding::joint_move_extend(
+            &h,
+            &target,
+            MoveMode::Incr,
+            1, // is_block: block until the motion completes
+            speed,
+            1.0, // acc, rad/s^2
+            0.0, // tol
+            std::ptr::null::<OptionalCond>(),
+        )
+    })
+    .await?;
 
     // Read the final joint angles
     let mut fin = JointValue::zero();
@@ -319,7 +346,20 @@ async fn restore(handle: &JKHD, file: &Path, speed: f64) -> Result<(), String> {
         file.display(),
         speed
     );
-    run_blocking_move(handle, target, MoveMode::Abs, speed).await?;
+    let h = *handle;
+    run_blocking_motion(handle, move || unsafe {
+        binding::joint_move_extend(
+            &h,
+            &target,
+            MoveMode::Abs,
+            1, // is_block: block until the motion completes
+            speed,
+            1.0, // acc, rad/s^2
+            0.0, // tol
+            std::ptr::null::<OptionalCond>(),
+        )
+    })
+    .await?;
 
     // Read the final joint angles
     let mut fin = JointValue::zero();
@@ -331,32 +371,19 @@ async fn restore(handle: &JKHD, file: &Path, speed: f64) -> Result<(), String> {
     Ok(())
 }
 
-/// Run a blocking SDK joint move with Ctrl+C abort support
-async fn run_blocking_move(
+/// Run a blocking SDK motion call with Ctrl+C abort support
+async fn run_blocking_motion(
     handle: &JKHD,
-    target: JointValue,
-    mode: MoveMode,
-    speed: f64,
+    motion: impl FnOnce() -> errno_t + Send + 'static,
 ) -> Result<(), String> {
     // The SDK move call blocks the calling thread. Run it on a blocking task so
     // the runtime stays responsive to the Ctrl+C signal
     let h = *handle;
-    let mut motion = tokio::task::spawn_blocking(move || unsafe {
-        binding::joint_move_extend(
-            &h,
-            &target,
-            mode,
-            1, // is_block: block until the motion completes
-            speed,
-            1.0, // acc, rad/s^2
-            0.0, // tol
-            std::ptr::null::<OptionalCond>(),
-        )
-    });
+    let mut task = tokio::task::spawn_blocking(motion);
 
     let outcome = tokio::select! {
-        ret = &mut motion => match ret {
-            Ok(code) => check("Joint move", code),
+        ret = &mut task => match ret {
+            Ok(code) => check("Motion", code),
             Err(e) => Err(format!("Motion task panicked: {e}")),
         },
         _ = tokio::signal::ctrl_c() => {
@@ -371,12 +398,114 @@ async fn run_blocking_move(
                 Err(e) => warn!("Abort command failed: {e}"),
             }
             // Give the blocked move call a moment to unwind before disconnecting
-            let _ = tokio::time::timeout(Duration::from_secs(5), &mut motion).await;
+            let _ = tokio::time::timeout(Duration::from_secs(5), &mut task).await;
             info!("Motion aborted by Ctrl+C");
             return Ok(());
         }
     };
     outcome
+}
+
+/// Move the TCP by a relative xyz offset in mm from the current position.
+/// Targets outside the workspace are clamped to the nearest reachable point
+async fn move_to(handle: &JKHD, x: f64, y: f64, z: f64, speed: f64) -> Result<(), String> {
+    // The current TCP pose is the reference position
+    let mut cur = CartesianPose::zero();
+    check("Read TCP position", unsafe {
+        binding::get_tcp_position(handle, &mut cur)
+    })?;
+    info!(
+        "Current TCP in mm: x={:.1}, y={:.1}, z={:.1}",
+        cur.tran.x, cur.tran.y, cur.tran.z
+    );
+
+    // Target is the current pose plus the offset, orientation unchanged
+    let mut target = cur;
+    target.tran.x += x;
+    target.tran.y += y;
+    target.tran.z += z;
+
+    // Current joints are the IK reference to pick the nearest solution
+    let mut ref_joint = JointValue::zero();
+    check("Read joint position", unsafe {
+        binding::get_joint_position(handle, &mut ref_joint)
+    })?;
+
+    let (goal, clamped) = resolve_with_clamp(handle, cur, target, &ref_joint)?;
+    if clamped {
+        warn!("Target is out of the workspace, clamped to the nearest reachable point");
+    }
+    info!(
+        "Target TCP in mm: x={:.1}, y={:.1}, z={:.1}",
+        goal.tran.x, goal.tran.y, goal.tran.z
+    );
+
+    info!("Moving linearly at {speed:.0} mm/s");
+    let h = *handle;
+    run_blocking_motion(handle, move || unsafe {
+        binding::linear_move_extend(
+            &h,
+            &goal,
+            MoveMode::Abs,
+            1, // is_block: block until the motion completes
+            speed,
+            500.0, // acc, mm/s^2
+            0.0,   // tol
+            std::ptr::null::<OptionalCond>(),
+        )
+    })
+    .await?;
+
+    // Read the final TCP position
+    let mut fin = CartesianPose::zero();
+    check("Read final TCP position", unsafe {
+        binding::get_tcp_position(handle, &mut fin)
+    })?;
+    info!(
+        "Final TCP in mm: x={:.1}, y={:.1}, z={:.1}",
+        fin.tran.x, fin.tran.y, fin.tran.z
+    );
+    info!("Done. Reached the target");
+    Ok(())
+}
+
+/// Inverse kinematics with clamping. When the target is unreachable, binary
+/// search along the line from the current pose to the target for the nearest
+/// reachable point
+fn resolve_with_clamp(
+    handle: &JKHD,
+    cur: CartesianPose,
+    target: CartesianPose,
+    ref_joint: &JointValue,
+) -> Result<(CartesianPose, bool), String> {
+    let mut joint = JointValue::zero();
+    let ret = unsafe { binding::kine_inverse(handle, ref_joint, &target, &mut joint) };
+    if ret == binding::ERR_SUCC {
+        return Ok((target, false));
+    }
+
+    // lo is always reachable, hi is not
+    let mut lo = 0.0_f64;
+    let mut hi = 1.0_f64;
+    for _ in 0..20 {
+        let mid = (lo + hi) / 2.0;
+        let mut probe = cur;
+        probe.tran.x = cur.tran.x + (target.tran.x - cur.tran.x) * mid;
+        probe.tran.y = cur.tran.y + (target.tran.y - cur.tran.y) * mid;
+        probe.tran.z = cur.tran.z + (target.tran.z - cur.tran.z) * mid;
+        let ret = unsafe { binding::kine_inverse(handle, ref_joint, &probe, &mut joint) };
+        if ret == binding::ERR_SUCC {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+
+    let mut goal = cur;
+    goal.tran.x = cur.tran.x + (target.tran.x - cur.tran.x) * lo;
+    goal.tran.y = cur.tran.y + (target.tran.y - cur.tran.y) * lo;
+    goal.tran.z = cur.tran.z + (target.tran.z - cur.tran.z) * lo;
+    Ok((goal, true))
 }
 
 fn print_state(st: &RobotState) {

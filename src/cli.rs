@@ -88,4 +88,24 @@ pub enum Command {
         #[arg(long, default_value_t = 0.8)]
         speed: f64,
     },
+
+    /// Move the TCP by a relative xyz offset in mm from the current position
+    #[command(disable_help_flag = true)]
+    MoveTo {
+        /// X offset in mm, relative to the current TCP position
+        #[arg(value_name = "X", allow_negative_numbers = true)]
+        x: f64,
+
+        /// Y offset in mm, relative to the current TCP position
+        #[arg(value_name = "Y", allow_negative_numbers = true)]
+        y: f64,
+
+        /// Z offset in mm, relative to the current TCP position
+        #[arg(value_name = "Z", allow_negative_numbers = true)]
+        z: f64,
+
+        /// Linear speed in mm/s
+        #[arg(long, default_value_t = 100.0)]
+        speed: f64,
+    },
 }
