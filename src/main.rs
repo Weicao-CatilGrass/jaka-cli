@@ -628,8 +628,17 @@ async fn move_to(
         binding::get_joint_position(handle, &mut ref_joint)
     })?;
 
-    let (goal, clamped) = resolve_with_clamp(handle, cur, target, &ref_joint, ori_jump)?;
-    if clamped {
+    let resolved = resolve_with_clamp(handle, cur, target, &ref_joint, ori_jump);
+    let goal = resolved.goal;
+    if resolved.adapted {
+        info!(
+            "Target orientation is not reachable, using the mirrored orientation rx={:.0}, ry={:.0}, rz={:.0}",
+            goal.rpy.rx.to_degrees(),
+            goal.rpy.ry.to_degrees(),
+            goal.rpy.rz.to_degrees()
+        );
+    }
+    if resolved.clamped {
         // The clamped point is the current position, so the robot is already
         // at the workspace boundary and there is nothing to move
         let dist = ((goal.tran.x - cur.tran.x).powi(2)
@@ -647,12 +656,20 @@ async fn move_to(
         goal.tran.x, goal.tran.y, goal.tran.z
     );
 
-    info!("Moving linearly at {speed:.0} mm/s");
+    // A linear move needs the whole straight path clear. A joint move only
+    // needs the end pose and transitions the orientation freely along the
+    // joint path, so it is used when the path is blocked or the orientation
+    // changes a lot
     let h = *handle;
-    let linear_result = if ori_jump {
-        info!("Large orientation change, using a joint move");
+    let linear_result = if resolved.joint {
+        if ori_jump {
+            info!("Large orientation change, using a joint move");
+        } else {
+            info!("Straight path is blocked, using a joint move");
+        }
         Err("skipped".to_string())
     } else {
+        info!("Moving linearly at {speed:.0} mm/s");
         run_blocking_motion(handle, move || unsafe {
             binding::linear_move_extend(
                 &h,
@@ -672,10 +689,10 @@ async fn move_to(
     // solution. Fall back to a joint move, which only needs the end point to
     // be reachable, so the robot always gets to the target
     if let Err(e) = linear_result {
-        if !ori_jump {
+        if !resolved.joint {
             warn!("Linear move failed: {e}. Falling back to a joint move");
         }
-        let Some(joint) = ik_solve(handle, &ref_joint, &goal) else {
+        let Some(joint) = ik_solve(handle, &ref_joint, &cur, &goal) else {
             return Err("Joint fallback failed, the target has no IK solution".into());
         };
         let h2 = *handle;
@@ -783,31 +800,76 @@ fn base_file_path() -> std::path::PathBuf {
         .join(BASE_FILE)
 }
 
-/// Inverse kinematics with clamping. When the target is unreachable, binary
-/// search along the line from the current pose to the target for the nearest
-/// reachable point. A candidate is only accepted when the whole straight path
-/// from the current pose to it is reachable, so the later linear move cannot
-/// fail midway
+/// The resolution of a move-to target
+struct ResolveResult {
+    goal: CartesianPose,
+    /// The straight path is blocked, the goal needs a joint move
+    joint: bool,
+    /// The goal was clamped inside the workspace
+    clamped: bool,
+    /// The target orientation was replaced by the mirrored one
+    adapted: bool,
+}
+
+/// Resolve the move target. A linear move needs the whole straight path
+/// reachable, a joint move only the end pose. When the straight path is
+/// blocked but the target itself is reachable, the move proceeds as a joint
+/// move with the orientation transitioning freely. When even the target is
+/// unreachable, binary search along the line from the current pose to the
+/// target for the nearest reachable point
 fn resolve_with_clamp(
     handle: &JKHD,
     cur: CartesianPose,
     target: CartesianPose,
     ref_joint: &JointValue,
     fixed_ori: bool,
-) -> Result<(CartesianPose, bool), String> {
+) -> ResolveResult {
     if path_clear(handle, &cur, &target, ref_joint, fixed_ori) {
-        return Ok((target, false));
+        // A big orientation change always moves in joints, the linear path
+        // is not used there
+        return ResolveResult {
+            goal: target,
+            joint: fixed_ori,
+            clamped: false,
+            adapted: false,
+        };
+    }
+
+    if !fixed_ori && ik_solve(handle, ref_joint, &cur, &target).is_some() {
+        // The target is reachable, only the straight line to it is blocked
+        return ResolveResult {
+            goal: target,
+            joint: true,
+            clamped: false,
+            adapted: false,
+        };
+    }
+
+    // The target orientation is unreachable at the target position. Try the
+    // mirrored orientation instead, flipping roll and pitch keeps the tool
+    // pointing the same way after a 180 degree turn around the base Z axis
+    let mut mirrored = target;
+    mirrored.rpy.rx = -target.rpy.rx;
+    mirrored.rpy.ry = -target.rpy.ry;
+    if ik_solve(handle, ref_joint, &cur, &mirrored).is_some() {
+        return ResolveResult {
+            goal: mirrored,
+            joint: true,
+            clamped: false,
+            adapted: true,
+        };
     }
 
     // lo is always reachable, hi is not. The orientation is interpolated
     // along the line instead of forcing the target one, a pose near the
-    // current position usually cannot hold the target orientation
+    // current position usually cannot hold the target orientation. Only the
+    // probe itself is checked, the final move is a joint move
     let mut lo = 0.0_f64;
     let mut hi = 1.0_f64;
     for _ in 0..20 {
         let mid = (lo + hi) / 2.0;
         let probe = lerp_pose(cur, target, mid);
-        if path_clear(handle, &cur, &probe, ref_joint, fixed_ori) {
+        if ik_solve(handle, ref_joint, &cur, &probe).is_some() {
             lo = mid;
         } else {
             hi = mid;
@@ -817,10 +879,20 @@ fn resolve_with_clamp(
     if lo < 0.001 {
         // Nothing reachable beyond the current position, so the robot is
         // already at the workspace boundary. The caller detects this case
-        return Ok((cur, true));
+        return ResolveResult {
+            goal: cur,
+            joint: true,
+            clamped: true,
+            adapted: false,
+        };
     }
     let goal = lerp_pose(cur, target, lo);
-    Ok((goal, true))
+    ResolveResult {
+        goal,
+        joint: true,
+        clamped: true,
+        adapted: false,
+    }
 }
 
 /// Check an IK solution against the JAKA Mini joint travel limits in degrees
@@ -843,8 +915,18 @@ fn joint_ok(j: &JointValue) -> bool {
 /// solution within the joint limits. The solver is reference-dependent and
 /// can fail or return out-of-limit solutions when the reference is far from
 /// the target, so multiple starting points are tried
-fn ik_solve(handle: &JKHD, current: &JointValue, pose: &CartesianPose) -> Option<JointValue> {
-    let refs = [*current, JointValue::zero(), home_joints()];
+fn ik_solve(
+    handle: &JKHD,
+    current: &JointValue,
+    cur: &CartesianPose,
+    pose: &CartesianPose,
+) -> Option<JointValue> {
+    let refs = vec![
+        *current,
+        JointValue::zero(),
+        home_joints(),
+        aimed_reference(current, cur, pose),
+    ];
     let mut joint = JointValue::zero();
     for r in refs {
         let ret = unsafe { binding::kine_inverse(handle, &r, pose, &mut joint) };
@@ -853,6 +935,22 @@ fn ik_solve(handle: &JKHD, current: &JointValue, pose: &CartesianPose) -> Option
         }
     }
     None
+}
+
+/// Build an IK reference by rotating the arm plane of the current joints
+/// toward the target. J1 is the only joint that rotates the arm plane, so
+/// the polar angle delta is applied to J1 alone while the elbow joints keep
+/// their current values, which stay close to the solution
+fn aimed_reference(
+    current: &JointValue,
+    cur: &CartesianPose,
+    target: &CartesianPose,
+) -> JointValue {
+    let mut ref_j = *current;
+    let cur_polar = cur.tran.y.atan2(cur.tran.x);
+    let target_polar = target.tran.y.atan2(target.tran.x);
+    ref_j.j_val[0] += target_polar - cur_polar;
+    ref_j
 }
 
 /// The default home pose in radians, used as an IK reference
@@ -887,7 +985,7 @@ fn path_clear(
                 continue;
             }
         }
-        if ik_solve(handle, ref_joint, &probe).is_none() {
+        if ik_solve(handle, ref_joint, from, &probe).is_none() {
             return false;
         }
     }
