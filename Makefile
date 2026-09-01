@@ -8,9 +8,6 @@ build:
 	cp target/release/jaka-cli build/jaka-cli
 	@echo "Binary copied to build/jaka-cli"
 
-run-jaka:
-	cargo run -- --ip $(IP) rot
-
 setup-jaka:
 	@echo "Downloading SDK from sdk/source.txt..."
 	@wget -O sdk.zip $$(cat sdk/source.txt)
