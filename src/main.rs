@@ -56,7 +56,7 @@ async fn main() -> ExitCode {
 
     let Some(command) = &args.command else {
         error!(
-            "No subcommand given. Expected one of status, power-on, power-off, estop-clear, inspect, dh, set-base, rot, restore, move-to. Use --help for usage"
+            "No subcommand given. Expected one of status, power-on, power-off, estop-clear, inspect, inspect-pos, dh, set-base, rot, restore, move-to. Use --help for usage"
         );
         return ExitCode::FAILURE;
     };
@@ -95,6 +95,10 @@ fn print_plan(args: &Cli, command: &Command) {
         ),
         Command::Inspect => info!(
             "[dry-run] Will connect to controller {} and print the joint angles as JSON",
+            args.ip
+        ),
+        Command::InspectPos => info!(
+            "[dry-run] Will connect to controller {} and print the TCP position as JSON",
             args.ip
         ),
         Command::Dh => info!(
@@ -204,6 +208,14 @@ async fn drive(handle: &JKHD, command: &Command, stdout_fd: i32) -> Result<(), S
                 binding::get_joint_position(handle, &mut cur)
             })?;
             print_joints_json(stdout_fd, &cur);
+            Ok(())
+        }
+        Command::InspectPos => {
+            let mut cur = CartesianPose::zero();
+            check("Read TCP position", unsafe {
+                binding::get_tcp_position(handle, &mut cur)
+            })?;
+            print_head_pos_json(stdout_fd, &cur);
             Ok(())
         }
         Command::Dh => {
@@ -726,6 +738,16 @@ fn format_joints(j: &JointValue) -> String {
         .map(|v| format!("{:.1}", v.to_degrees()))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Print the TCP position relative to the base frame as a JSON object on the
+/// original stdout. Positions are in mm, the base frame origin is [0,0,0]
+fn print_head_pos_json(fd: i32, pose: &CartesianPose) {
+    let json = serde_json::json!({
+        "head_pos": [pose.tran.x, pose.tran.y, pose.tran.z],
+        "base_pos": [0.0, 0.0, 0.0],
+    });
+    binding::write_to_fd(fd, &format!("{json}\n"));
 }
 
 /// Print the joint angles in degrees as a JSON object on the original stdout

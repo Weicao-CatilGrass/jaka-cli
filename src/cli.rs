@@ -56,6 +56,10 @@ pub enum Command {
     #[command(disable_help_flag = true)]
     Inspect,
 
+    /// Print the TCP position relative to the base as JSON to stdout
+    #[command(disable_help_flag = true)]
+    InspectPos,
+
     /// Print the DH parameters as JSON to stdout
     #[command(disable_help_flag = true)]
     Dh,

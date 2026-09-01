@@ -9,6 +9,7 @@ Commands:
   power-off   Disable servos and power off
   estop-clear Clear the e-stop error state, release the physical button first
   inspect     Print the joint angles in degrees as JSON to stdout
+  inspect-pos Print the TCP position relative to the base as JSON to stdout
   dh          Print the DH parameters as JSON to stdout
   rot         Power on, enable, then rotate the specified joint
   restore     Restore the joint angles recorded by inspect from a JSON file
