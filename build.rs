@@ -33,7 +33,14 @@ fn main() {
         other => panic!("unsupported target OS: {other}"),
     }
 
+    // The exception-safe C++ shim around the SDK
+    cc::Build::new()
+        .cpp(true)
+        .file("ffi/sdk_shim.cpp")
+        .compile("jaka_shim");
+
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=ffi/sdk_shim.cpp");
 }
 
 /// Copy the SDK dll next to the built executable. build.rs runs on the host,

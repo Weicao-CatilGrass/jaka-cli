@@ -15,8 +15,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use binding::{
-    BOOL, CartesianPose, DHParam, JKHD, JointValue, MoveMode, OptionalCond, RobotState, check,
-    errno_t,
+    BOOL, CartesianPose, CartesianTran, DHParam, JKHD, JointValue, MoveMode, OptionalCond,
+    RobotState, Rpy, check, errno_t,
 };
 use clap::Parser;
 use cli::{Cli, Command};
@@ -501,6 +501,16 @@ async fn move_to(
 
     let (goal, clamped) = resolve_with_clamp(handle, cur, target, &ref_joint)?;
     if clamped {
+        // The clamped point is the current position, so the robot is already
+        // at the workspace boundary and there is nothing to move
+        let dist = ((goal.tran.x - cur.tran.x).powi(2)
+            + (goal.tran.y - cur.tran.y).powi(2)
+            + (goal.tran.z - cur.tran.z).powi(2))
+        .sqrt();
+        if dist < 1.0 {
+            info!("Already at the workspace boundary, nothing to move");
+            return Ok(());
+        }
         warn!("Target is out of the workspace, clamped to the nearest reachable point");
     }
     info!(
@@ -599,16 +609,16 @@ fn base_file_path() -> std::path::PathBuf {
 
 /// Inverse kinematics with clamping. When the target is unreachable, binary
 /// search along the line from the current pose to the target for the nearest
-/// reachable point
+/// reachable point. A candidate is only accepted when the whole straight path
+/// from the current pose to it is reachable, so the later linear move cannot
+/// fail midway
 fn resolve_with_clamp(
     handle: &JKHD,
     cur: CartesianPose,
     target: CartesianPose,
     ref_joint: &JointValue,
 ) -> Result<(CartesianPose, bool), String> {
-    let mut joint = JointValue::zero();
-    let ret = unsafe { binding::kine_inverse(handle, ref_joint, &target, &mut joint) };
-    if ret == binding::ERR_SUCC {
+    if path_clear(handle, &cur, &target, ref_joint) {
         return Ok((target, false));
     }
 
@@ -617,23 +627,59 @@ fn resolve_with_clamp(
     let mut hi = 1.0_f64;
     for _ in 0..20 {
         let mid = (lo + hi) / 2.0;
-        let mut probe = cur;
-        probe.tran.x = cur.tran.x + (target.tran.x - cur.tran.x) * mid;
-        probe.tran.y = cur.tran.y + (target.tran.y - cur.tran.y) * mid;
-        probe.tran.z = cur.tran.z + (target.tran.z - cur.tran.z) * mid;
-        let ret = unsafe { binding::kine_inverse(handle, ref_joint, &probe, &mut joint) };
-        if ret == binding::ERR_SUCC {
+        let probe = lerp_pose(cur, target, mid);
+        if path_clear(handle, &cur, &probe, ref_joint) {
             lo = mid;
         } else {
             hi = mid;
         }
     }
 
-    let mut goal = cur;
-    goal.tran.x = cur.tran.x + (target.tran.x - cur.tran.x) * lo;
-    goal.tran.y = cur.tran.y + (target.tran.y - cur.tran.y) * lo;
-    goal.tran.z = cur.tran.z + (target.tran.z - cur.tran.z) * lo;
+    if lo < 0.001 {
+        // Nothing reachable beyond the current position, so the robot is
+        // already at the workspace boundary. The caller detects this case
+        return Ok((cur, true));
+    }
+    let goal = lerp_pose(cur, target, lo);
     Ok((goal, true))
+}
+
+/// Check that every sample along the straight path from from to to has a valid
+/// inverse kinematics solution
+fn path_clear(
+    handle: &JKHD,
+    from: &CartesianPose,
+    to: &CartesianPose,
+    ref_joint: &JointValue,
+) -> bool {
+    const SAMPLES: usize = 8;
+    for i in 0..=SAMPLES {
+        let t = i as f64 / SAMPLES as f64;
+        let probe = lerp_pose(*from, *to, t);
+        let mut joint = JointValue::zero();
+        let ret = unsafe { binding::kine_inverse(handle, ref_joint, &probe, &mut joint) };
+        if ret != binding::ERR_SUCC {
+            return false;
+        }
+    }
+    true
+}
+
+/// Linear interpolation between two poses, translation and orientation
+fn lerp_pose(from: CartesianPose, to: CartesianPose, t: f64) -> CartesianPose {
+    let lerp = |a: f64, b: f64| a + (b - a) * t;
+    CartesianPose {
+        tran: CartesianTran {
+            x: lerp(from.tran.x, to.tran.x),
+            y: lerp(from.tran.y, to.tran.y),
+            z: lerp(from.tran.z, to.tran.z),
+        },
+        rpy: Rpy {
+            rx: lerp(from.rpy.rx, to.rpy.rx),
+            ry: lerp(from.rpy.ry, to.rpy.ry),
+            rz: lerp(from.rpy.rz, to.rpy.rz),
+        },
+    }
 }
 
 fn print_state(st: &RobotState) {

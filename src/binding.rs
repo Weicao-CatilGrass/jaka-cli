@@ -104,18 +104,29 @@ pub struct OptionalCond {
 #[link(name = "jakaAPI")]
 unsafe extern "C" {
     /// Create a connection handle
+    #[link_name = "jk_safe_create_handler"]
     pub fn create_handler(ip: *const c_char, handle: *mut JKHD) -> errno_t;
     /// Destroy the handle and disconnect. The SDK header spells it "destory"
+    #[link_name = "jk_safe_destory_handler"]
     pub fn destory_handler(handle: *const JKHD) -> errno_t;
+    #[link_name = "jk_safe_power_on"]
     pub fn power_on(handle: *const JKHD) -> errno_t;
+    #[link_name = "jk_safe_power_off"]
     pub fn power_off(handle: *const JKHD) -> errno_t;
+    #[link_name = "jk_safe_enable_robot"]
     pub fn enable_robot(handle: *const JKHD) -> errno_t;
+    #[link_name = "jk_safe_disable_robot"]
     pub fn disable_robot(handle: *const JKHD) -> errno_t;
+    #[link_name = "jk_safe_get_robot_state"]
     pub fn get_robot_state(handle: *const JKHD, state: *mut RobotState) -> errno_t;
+    #[link_name = "jk_safe_get_dh_param"]
     pub fn get_dh_param(handle: *const JKHD, dh_param: *mut DHParam) -> errno_t;
+    #[link_name = "jk_safe_get_joint_position"]
     pub fn get_joint_position(handle: *const JKHD, pos: *mut JointValue) -> errno_t;
+    #[link_name = "jk_safe_get_tcp_position"]
     pub fn get_tcp_position(handle: *const JKHD, tcp_position: *mut CartesianPose) -> errno_t;
     /// Inverse kinematics with a reference joint pose to disambiguate solutions
+    #[link_name = "jk_safe_kine_inverse"]
     pub fn kine_inverse(
         handle: *const JKHD,
         ref_pos: *const JointValue,
@@ -123,25 +134,13 @@ unsafe extern "C" {
         joint_pos: *mut JointValue,
     ) -> errno_t;
     /// Forward kinematics
+    #[link_name = "jk_safe_kine_forward"]
     pub fn kine_forward(
         handle: *const JKHD,
         joint_pos: *const JointValue,
         cartesian_pose: *mut CartesianPose,
     ) -> errno_t;
-    pub fn linear_move_extend(
-        handle: *const JKHD,
-        end_pos: *const CartesianPose,
-        move_mode: MoveMode,
-        is_block: BOOL,
-        speed: f64,
-        acc: f64,
-        tol: f64,
-        option_cond: *const OptionalCond,
-    ) -> errno_t;
-    pub fn is_in_estop(handle: *const JKHD, in_estop: *mut BOOL) -> errno_t;
-    pub fn clear_error(handle: *const JKHD) -> errno_t;
-    /// Stop all ongoing movements of the cobot
-    pub fn motion_abort(handle: *const JKHD) -> errno_t;
+    #[link_name = "jk_safe_joint_move_extend"]
     pub fn joint_move_extend(
         handle: *const JKHD,
         joint_pos: *const JointValue,
@@ -152,6 +151,24 @@ unsafe extern "C" {
         tol: f64,
         option_cond: *const OptionalCond,
     ) -> errno_t;
+    #[link_name = "jk_safe_linear_move_extend"]
+    pub fn linear_move_extend(
+        handle: *const JKHD,
+        end_pos: *const CartesianPose,
+        move_mode: MoveMode,
+        is_block: BOOL,
+        speed: f64,
+        acc: f64,
+        tol: f64,
+        option_cond: *const OptionalCond,
+    ) -> errno_t;
+    /// Stop all ongoing movements of the cobot
+    #[link_name = "jk_safe_motion_abort"]
+    pub fn motion_abort(handle: *const JKHD) -> errno_t;
+    #[link_name = "jk_safe_is_in_estop"]
+    pub fn is_in_estop(handle: *const JKHD, in_estop: *mut BOOL) -> errno_t;
+    #[link_name = "jk_safe_clear_error"]
+    pub fn clear_error(handle: *const JKHD) -> errno_t;
 }
 
 // POSIX file descriptor helpers used to keep SDK printf output off stdout
@@ -234,6 +251,7 @@ pub fn err_name(code: errno_t) -> &'static str {
         -22 => "Soft limit reached",
         -41 => "Joint move failed",
         -42 => "Circular move failed",
+        -999 => "SDK exception",
         _ => "Unknown error",
     }
 }

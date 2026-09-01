@@ -10,3 +10,6 @@ log = "0.4.34"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["rt", "macros", "rt-multi-thread", "signal", "time"] }
+
+[build-dependencies]
+cc = "1.4.4"
