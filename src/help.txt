@@ -41,6 +41,7 @@ Examples:
   jaka-cli rot --speed 3.14
   jaka-cli inspect > pose.json
   jaka-cli restore pose.json
+  jaka-cli restore
   jaka-cli set-base
   jaka-cli move-to 100 0 0
   jaka-cli move-to 100 0 0 --rx 90

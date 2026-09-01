@@ -77,15 +77,16 @@ pub enum Command {
         speed: f64,
     },
 
-    /// Restore the joint angles recorded by inspect from a JSON file
+    /// Restore the joint angles recorded by inspect from a JSON file.
+    /// Without a file the built-in default pose is used
     #[command(disable_help_flag = true)]
     Restore {
-        /// Path to the JSON file produced by inspect
+        /// Path to the JSON file produced by inspect, defaults to the built-in pose
         #[arg(value_name = "JSON_FILE")]
-        file: PathBuf,
+        file: Option<PathBuf>,
 
         /// Joint speed in radians per second
-        #[arg(long, default_value_t = 0.8)]
+        #[arg(long, default_value_t = 100.0)]
         speed: f64,
     },
 

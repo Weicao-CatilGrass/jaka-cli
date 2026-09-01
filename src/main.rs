@@ -113,12 +113,15 @@ fn print_plan(args: &Cli, command: &Command) {
             );
         }
         Command::Restore { file, speed } => {
+            let name = file
+                .as_deref()
+                .map(|f| f.display().to_string())
+                .unwrap_or_else(|| "built-in default pose".to_string());
             info!(
                 "[dry-run] Will connect to controller {} and restore joints from {}",
-                args.ip,
-                file.display()
+                args.ip, name
             );
-            info!("[dry-run] Speed {:.2} rad/s", speed);
+            info!("[dry-run] Speed {speed:.2} rad/s");
         }
         Command::MoveTo {
             x,
@@ -243,7 +246,7 @@ async fn drive(handle: &JKHD, command: &Command, stdout_fd: i32) -> Result<(), S
             ensure_powered_enabled(handle, &st)?;
             match command {
                 Command::Rot { joint, deg, speed } => rot(handle, *joint, *deg, *speed).await,
-                Command::Restore { file, speed } => restore(handle, file, *speed).await,
+                Command::Restore { file, speed } => restore(handle, file.as_deref(), *speed).await,
                 Command::MoveTo {
                     x,
                     y,
@@ -308,6 +311,8 @@ fn estop_clear(handle: &JKHD) -> Result<(), String> {
 
 /// Rotate one joint by deg degrees using an incremental move
 async fn rot(handle: &JKHD, joint: i32, deg: f64, speed: f64) -> Result<(), String> {
+    let speed = clamp_joint_speed(speed);
+
     // Read the current joint angles
     let mut cur = JointValue::zero();
     check("Read joint position", unsafe {
@@ -351,17 +356,23 @@ async fn rot(handle: &JKHD, joint: i32, deg: f64, speed: f64) -> Result<(), Stri
         binding::get_joint_position(handle, &mut fin)
     })?;
     info!("Final joint angles in degrees: {}", format_joints(&fin));
-    info!("Done. The arm completed a full rotation");
+    info!("Done. Rotation complete");
     Ok(())
 }
 
-/// Restore the joint angles recorded by inspect from a JSON file
-async fn restore(handle: &JKHD, file: &Path, speed: f64) -> Result<(), String> {
-    // Load and parse the recorded joints, stored in degrees
-    let text = std::fs::read_to_string(file)
-        .map_err(|e| format!("Failed to read {}: {e}", file.display()))?;
-    let doc: JointsDoc = serde_json::from_str(&text)
-        .map_err(|e| format!("Invalid JSON in {}: {e}", file.display()))?;
+/// Restore the joint angles recorded by inspect from a JSON file. Without a
+/// file the built-in default pose is used
+async fn restore(handle: &JKHD, file: Option<&Path>, speed: f64) -> Result<(), String> {
+    let speed = clamp_joint_speed(speed);
+
+    // Load and parse the recorded joints, stored in degrees. The built-in
+    // default pose is embedded at compile time so the binary stays standalone
+    let text = match file {
+        Some(path) => std::fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read {}: {e}", path.display()))?,
+        None => include_str!("../stat-preset/default.json").to_string(),
+    };
+    let doc: JointsDoc = serde_json::from_str(&text).map_err(|e| format!("Invalid JSON: {e}"))?;
     if doc.joints.len() != 6 {
         return Err(format!(
             "joints must contain 6 values, got {}",
@@ -384,9 +395,9 @@ async fn restore(handle: &JKHD, file: &Path, speed: f64) -> Result<(), String> {
     info!("Target joint angles in degrees: {}", format_joints(&target));
 
     info!(
-        "Restoring joints from {} at {:.2} rad/s",
-        file.display(),
-        speed
+        "Restoring joints from {} at {speed:.2} rad/s",
+        file.map(|f| f.display().to_string())
+            .unwrap_or_else(|| "built-in default pose".to_string())
     );
     let h = *handle;
     run_blocking_motion(handle, move || unsafe {
@@ -446,6 +457,21 @@ async fn run_blocking_motion(
         }
     };
     outcome
+}
+
+/// Clamp the joint speed to the controller's valid range
+fn clamp_joint_speed(speed: f64) -> f64 {
+    const MAX: f64 = 3.14; // rad/s, the fastest any JAKA joint can move
+    const MIN: f64 = 0.01;
+    if speed > MAX {
+        warn!("Speed {speed:.2} rad/s exceeds the joint limit, clamped to {MAX:.2} rad/s");
+        MAX
+    } else if speed < MIN {
+        warn!("Speed {speed:.2} rad/s is too slow, clamped to {MIN:.2} rad/s");
+        MIN
+    } else {
+        speed
+    }
 }
 
 /// Move the TCP to a fixed target: the base pose plus an xyz offset in mm.
