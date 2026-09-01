@@ -43,6 +43,16 @@ pub struct RobotState {
     pub servo_enabled: BOOL,
 }
 
+/// DH parameters (jktypes.h: DHParam)
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DHParam {
+    pub alpha: [f64; 6],
+    pub a: [f64; 6],
+    pub d: [f64; 6],
+    pub joint_homeoff: [f64; 6],
+}
+
 /// Motion mode (jktypes.h: MoveMode)
 #[repr(i32)]
 #[allow(dead_code)] // Abs/Continue are not used yet but kept to mirror the header
@@ -70,6 +80,7 @@ unsafe extern "C" {
     pub fn enable_robot(handle: *const JKHD) -> errno_t;
     pub fn disable_robot(handle: *const JKHD) -> errno_t;
     pub fn get_robot_state(handle: *const JKHD, state: *mut RobotState) -> errno_t;
+    pub fn get_dh_param(handle: *const JKHD, dh_param: *mut DHParam) -> errno_t;
     pub fn get_joint_position(handle: *const JKHD, pos: *mut JointValue) -> errno_t;
     pub fn is_in_estop(handle: *const JKHD, in_estop: *mut BOOL) -> errno_t;
     pub fn clear_error(handle: *const JKHD) -> errno_t;

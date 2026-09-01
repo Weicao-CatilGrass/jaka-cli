@@ -14,7 +14,7 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use binding::{BOOL, JKHD, JointValue, MoveMode, OptionalCond, RobotState, check};
+use binding::{BOOL, DHParam, JKHD, JointValue, MoveMode, OptionalCond, RobotState, check};
 use clap::Parser;
 use cli::{Cli, Command};
 use log::{error, info, warn};
@@ -42,7 +42,7 @@ async fn main() -> ExitCode {
 
     let Some(command) = &args.command else {
         error!(
-            "No subcommand given. Expected one of status, power-on, power-off, estop-clear, inspect, rot, restore. Use --help for usage"
+            "No subcommand given. Expected one of status, power-on, power-off, estop-clear, inspect, dh, rot, restore. Use --help for usage"
         );
         return ExitCode::FAILURE;
     };
@@ -81,6 +81,10 @@ fn print_plan(args: &Cli, command: &Command) {
         ),
         Command::Inspect => info!(
             "[dry-run] Will connect to controller {} and print the joint angles as JSON",
+            args.ip
+        ),
+        Command::Dh => info!(
+            "[dry-run] Will connect to controller {} and print the DH parameters as JSON",
             args.ip
         ),
         Command::Rot { joint, deg, speed } => {
@@ -153,6 +157,21 @@ async fn drive(handle: &JKHD, command: &Command, stdout_fd: i32) -> Result<(), S
                 binding::get_joint_position(handle, &mut cur)
             })?;
             print_joints_json(stdout_fd, &cur);
+            Ok(())
+        }
+        Command::Dh => {
+            let mut dh = DHParam::default();
+            check("Read DH parameters", unsafe {
+                binding::get_dh_param(handle, &mut dh)
+            })?;
+            info!("DH alpha in degrees: {}", fmt_array(&dh.alpha));
+            info!("DH a in mm: {}", fmt_array(&dh.a));
+            info!("DH d in mm: {}", fmt_array(&dh.d));
+            info!(
+                "DH joint_homeoff in degrees: {}",
+                fmt_array(&dh.joint_homeoff)
+            );
+            print_dh_json(stdout_fd, &dh);
             Ok(())
         }
         Command::PowerOff => {
@@ -385,4 +404,22 @@ fn print_joints_json(fd: i32, j: &JointValue) {
     let joints: Vec<f64> = j.j_val.iter().map(|v| v.to_degrees()).collect();
     let json = serde_json::json!({ "joints": joints }).to_string();
     binding::write_to_fd(fd, &format!("{json}\n"));
+}
+
+/// Print the DH parameters as a JSON object on the original stdout
+fn print_dh_json(fd: i32, dh: &DHParam) {
+    let json = serde_json::json!({
+        "alpha": dh.alpha,
+        "a": dh.a,
+        "d": dh.d,
+        "joint_homeoff": dh.joint_homeoff,
+    });
+    binding::write_to_fd(fd, &format!("{json}\n"));
+}
+
+fn fmt_array(vals: &[f64; 6]) -> String {
+    vals.iter()
+        .map(|v| format!("{:.3}", v.to_degrees()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }

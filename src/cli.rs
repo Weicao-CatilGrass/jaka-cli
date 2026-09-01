@@ -56,6 +56,10 @@ pub enum Command {
     #[command(disable_help_flag = true)]
     Inspect,
 
+    /// Print the DH parameters as JSON to stdout
+    #[command(disable_help_flag = true)]
+    Dh,
+
     /// Power on, enable, then rotate the specified joint
     /// Rotate the specified joint
     #[command(disable_help_flag = true)]
