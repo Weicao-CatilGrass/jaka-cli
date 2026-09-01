@@ -108,6 +108,18 @@ pub enum Command {
         /// Linear speed in mm/s
         #[arg(long, default_value_t = 100.0)]
         speed: f64,
+
+        /// Target roll in degrees in the base frame, keep current when omitted
+        #[arg(long, allow_negative_numbers = true)]
+        rx: Option<f64>,
+
+        /// Target pitch in degrees in the base frame, keep current when omitted
+        #[arg(long, allow_negative_numbers = true)]
+        ry: Option<f64>,
+
+        /// Target yaw in degrees in the base frame, keep current when omitted
+        #[arg(long, allow_negative_numbers = true)]
+        rz: Option<f64>,
     },
 
     /// Save the current TCP position as the base pose for move-to

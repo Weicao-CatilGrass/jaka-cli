@@ -43,4 +43,5 @@ Examples:
   jaka-cli restore pose.json
   jaka-cli set-base
   jaka-cli move-to 100 0 0
+  jaka-cli move-to 100 0 0 --rx 90
   jaka-cli --dry-run rot --joint 3

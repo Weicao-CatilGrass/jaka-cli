@@ -120,11 +120,29 @@ fn print_plan(args: &Cli, command: &Command) {
             );
             info!("[dry-run] Speed {:.2} rad/s", speed);
         }
-        Command::MoveTo { x, y, z, speed } => {
+        Command::MoveTo {
+            x,
+            y,
+            z,
+            speed,
+            rx,
+            ry,
+            rz,
+        } => {
             info!(
                 "[dry-run] Will connect to controller {} and move the TCP to base + ({x}, {y}, {z}) mm",
                 args.ip
             );
+            let ori = match (rx, ry, rz) {
+                (None, None, None) => "keep current".to_string(),
+                _ => format!(
+                    "rx={}, ry={}, rz={} degrees",
+                    rx.unwrap_or(f64::NAN),
+                    ry.unwrap_or(f64::NAN),
+                    rz.unwrap_or(f64::NAN)
+                ),
+            };
+            info!("[dry-run] Orientation: {ori}");
             info!("[dry-run] Linear speed {speed:.0} mm/s, out-of-workspace targets get clamped");
         }
         Command::SetBase => info!(
@@ -226,7 +244,15 @@ async fn drive(handle: &JKHD, command: &Command, stdout_fd: i32) -> Result<(), S
             match command {
                 Command::Rot { joint, deg, speed } => rot(handle, *joint, *deg, *speed).await,
                 Command::Restore { file, speed } => restore(handle, file, *speed).await,
-                Command::MoveTo { x, y, z, speed } => move_to(handle, *x, *y, *z, *speed).await,
+                Command::MoveTo {
+                    x,
+                    y,
+                    z,
+                    speed,
+                    rx,
+                    ry,
+                    rz,
+                } => move_to(handle, *x, *y, *z, *speed, *rx, *ry, *rz).await,
                 _ => Ok(()),
             }
         }
@@ -423,10 +449,20 @@ async fn run_blocking_motion(
 }
 
 /// Move the TCP to a fixed target: the base pose plus an xyz offset in mm.
+/// Orientation is either the current one or the explicit rx/ry/rz in degrees.
 /// The base pose is either the robot home position or the one saved by
 /// set-base. Targets outside the workspace are clamped to the nearest
 /// reachable point. Repeating the same command is a no-op once in position
-async fn move_to(handle: &JKHD, x: f64, y: f64, z: f64, speed: f64) -> Result<(), String> {
+async fn move_to(
+    handle: &JKHD,
+    x: f64,
+    y: f64,
+    z: f64,
+    speed: f64,
+    rx: Option<f64>,
+    ry: Option<f64>,
+    rz: Option<f64>,
+) -> Result<(), String> {
     // The current TCP pose provides the orientation, which is kept unchanged
     let mut cur = CartesianPose::zero();
     check("Read TCP position", unsafe {
@@ -447,12 +483,15 @@ async fn move_to(handle: &JKHD, x: f64, y: f64, z: f64, speed: f64) -> Result<()
         );
     }
 
-    // Target is the base pose plus the offset, current orientation kept
+    // Target is the base pose plus the offset. Orientation comes from the
+    // explicit angles when given, otherwise the current one is kept
     let mut target = base;
     target.tran.x += x;
     target.tran.y += y;
     target.tran.z += z;
-    target.rpy = cur.rpy;
+    target.rpy.rx = rx.map(|v| v.to_radians()).unwrap_or(cur.rpy.rx);
+    target.rpy.ry = ry.map(|v| v.to_radians()).unwrap_or(cur.rpy.ry);
+    target.rpy.rz = rz.map(|v| v.to_radians()).unwrap_or(cur.rpy.rz);
 
     // Current joints are the IK reference to pick the nearest solution
     let mut ref_joint = JointValue::zero();
