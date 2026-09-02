@@ -66,4 +66,5 @@ Examples:
   jaka-cli move-to -50 0 400 --rel
   jaka-cli inspect-pos > desk.json
   jaka-cli move-to --pose desk.json
+  jaka-cli move-to --json '{"head_pos":[100,0,300],"head_rpy":[0,90,0]}'
   jaka-cli --dry-run rot --joint 3

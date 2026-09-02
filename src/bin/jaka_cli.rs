@@ -151,6 +151,7 @@ fn print_plan(args: &Cli, command: &Command) {
             rz,
             rel,
             pose,
+            json,
         } => {
             if let Some(path) = pose {
                 info!(
@@ -158,9 +159,14 @@ fn print_plan(args: &Cli, command: &Command) {
                     args.ip,
                     path.display()
                 );
+            } else if json.is_some() {
+                info!(
+                    "[dry-run] Will connect to controller {} and move the TCP to the pose from --json",
+                    args.ip
+                );
             } else {
                 let (Some(x), Some(y), Some(z)) = (x, y, z) else {
-                    error!("x, y, z are required unless --pose is given");
+                    error!("x, y, z are required unless --pose or --json is given");
                     return;
                 };
                 let mode = if *rel { "base + offset" } else { "absolute" };
@@ -335,8 +341,9 @@ async fn drive(handle: &JKHD, command: &Command, stdout_fd: i32) -> Result<(), S
                     rz,
                     rel,
                     pose,
+                    json,
                 } => {
-                    if pose.is_some() {
+                    if pose.is_some() || json.is_some() {
                         return move_to(
                             handle,
                             0.0,
@@ -348,13 +355,14 @@ async fn drive(handle: &JKHD, command: &Command, stdout_fd: i32) -> Result<(), S
                             *rz,
                             *rel,
                             pose.as_deref(),
+                            json.as_deref(),
                         )
                         .await;
                     }
                     let (Some(x), Some(y), Some(z)) = (x, y, z) else {
-                        return Err("x, y, z are required unless --pose is given".into());
+                        return Err("x, y, z are required unless --pose or --json is given".into());
                     };
-                    move_to(handle, *x, *y, *z, *speed, *rx, *ry, *rz, *rel, None).await
+                    move_to(handle, *x, *y, *z, *speed, *rx, *ry, *rz, *rel, None, None).await
                 }
                 _ => Ok(()),
             }
@@ -590,6 +598,7 @@ async fn move_to(
     rz: Option<f64>,
     rel: bool,
     pose: Option<&Path>,
+    json: Option<&str>,
 ) -> Result<(), String> {
     // The current TCP pose provides the orientation unless overridden
     let mut cur = CartesianPose::zero();
@@ -597,12 +606,20 @@ async fn move_to(
         binding::get_tcp_position(handle, &mut cur)
     })?;
 
-    // A pose file from inspect-pos overrides position and orientation
-    let (tx, ty, tz, trx, try_, trz) = if let Some(path) = pose {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
-        let doc: PoseDoc = serde_json::from_str(&text)
-            .map_err(|e| format!("Invalid pose JSON in {}: {e}", path.display()))?;
+    // A pose document from a file or --json overrides position and
+    // orientation, both are inspect-pos JSON
+    let doc_text: Option<(&str, String)> = match (pose, json) {
+        (Some(path), _) => Some((
+            "pose file",
+            std::fs::read_to_string(path)
+                .map_err(|e| format!("Failed to read {}: {e}", path.display()))?,
+        )),
+        (None, Some(text)) => Some(("--json", text.to_string())),
+        (None, None) => None,
+    };
+    let (tx, ty, tz, trx, try_, trz) = if let Some((src, text)) = doc_text {
+        let doc: PoseDoc =
+            serde_json::from_str(&text).map_err(|e| format!("Invalid pose JSON in {src}: {e}"))?;
         if doc.head_pos.len() != 3 {
             return Err(format!(
                 "head_pos must have 3 values, got {}",

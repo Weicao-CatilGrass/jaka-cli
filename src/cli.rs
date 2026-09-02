@@ -123,6 +123,10 @@ pub enum Command {
         #[arg(long, value_name = "POSE_FILE", conflicts_with_all = ["x", "y", "z"])]
         pose: Option<PathBuf>,
 
+        /// The absolute target pose as an inspect-pos JSON string, position and orientation together
+        #[arg(long, value_name = "JSON", conflicts_with_all = ["x", "y", "z", "pose"])]
+        json: Option<String>,
+
         /// Target roll in degrees in the base frame, keep current when omitted
         #[arg(long, allow_negative_numbers = true)]
         rx: Option<f64>,
