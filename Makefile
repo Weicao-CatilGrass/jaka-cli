@@ -1,4 +1,4 @@
-.PHONY: setup-jaka run-jaka build build-linux build-win
+.PHONY: clean setup-jaka run-jaka build build-linux build-win
 
 IP ?= 10.5.5.100
 
@@ -12,10 +12,15 @@ define copy_bins
 		case "$$bin" in \
 			*.d) ;; \
 			*) cp "$$bin" $(2)/; \
-			   echo "Copied $$(basename $$bin) to $(2)/";; \
+						echo "Copied $$(basename $$bin) to $(2)/";; \
 		esac; \
 	done
 endef
+
+# Remove the build directory and clean cargo artifacts
+clean:
+	rm -rf build
+	cargo clean --workspace
 
 # Current-platform release build, output to build/
 build:
