@@ -1041,20 +1041,47 @@ async fn serve(backend: Backend, port: u16, mock: bool) -> Result<(), String> {
     } else {
         info!("Control server listening on port {port}");
     }
+    // All client tasks, aborted and joined on shutdown
+    let mut clients: Vec<JoinHandle<()>> = Vec::new();
     loop {
-        let (stream, addr) = listener
-            .accept()
-            .await
-            .map_err(|e| format!("Accept failed: {e}"))?;
-        info!("Control client connected from {addr}");
-        let mut backend = backend.clone();
-        let mock = mock;
-        tokio::spawn(async move {
-            if let Err(e) = handle_client(&mut backend, stream, mock).await {
-                warn!("Control client {addr} error: {e}");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!("Ctrl+C received, stopping all motions and disconnecting clients");
+                // Stop every ongoing motion first, the SDK abort is global
+                if let Backend::Real(handle) = backend {
+                    let _ = unsafe { binding::motion_abort(&handle) };
+                }
+                // Aborting the tasks drops the streams and closes the
+                // client connections
+                for c in &clients {
+                    c.abort();
+                }
+                for c in clients {
+                    let _ = c.await;
+                }
+                break;
             }
-        });
+            accepted = listener.accept() => {
+                let (stream, addr) = match accepted {
+                    Ok(x) => x,
+                    Err(e) => {
+                        warn!("Accept failed: {e}");
+                        continue;
+                    }
+                };
+                info!("Control client connected from {addr}");
+                let mut backend = backend.clone();
+                let mock = mock;
+                clients.push(tokio::spawn(async move {
+                    if let Err(e) = handle_client(&mut backend, stream, mock).await {
+                        warn!("Control client {addr} error: {e}");
+                    }
+                }));
+            }
+        }
     }
+    info!("Control server stopped");
+    Ok(())
 }
 
 /// Serve one control client: read protocol lines, reply to each command
