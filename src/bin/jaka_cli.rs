@@ -930,7 +930,7 @@ enum ProtoCmd {
 
 /// Safe jog velocity limits, translations in mm/s and rotations in deg/s
 const MAX_LIN_VEL: f64 = 100.0;
-const MAX_ROT_VEL: f64 = 30.0;
+const MAX_ROT_VEL: f64 = 20.0;
 
 /// Clamp the requested velocities to the safe limits
 fn clamp_vel(v: [f64; 6]) -> [f64; 6] {
@@ -956,8 +956,8 @@ enum Backend {
 }
 
 /// The real-arm servo state. Velocity commands only set the target, a
-/// periodic pulse loop ramps the fed velocity toward it and streams position
-/// deltas to the controller, so every axis moves at the same time
+/// periodic pulse loop ramps the fed velocity toward it and streams absolute
+/// poses to the controller, so every axis moves at the same time
 #[derive(Clone, Copy)]
 struct ServoState {
     /// Whether servo mode is active on the controller
@@ -966,6 +966,15 @@ struct ServoState {
     vel: [f64; 6],
     /// The target velocity of the protocol, in mm/s and deg/s
     target: [f64; 6],
+    /// Absolute TCP translation of the model, mm
+    tran: [f64; 3],
+    /// Absolute orientation of the model, a row-major 3x3 rotation matrix.
+    /// The matrix accumulates base-axis rotations, the rpy sent to the SDK
+    /// is extracted from it, so the model stays valid through the gimbal
+    /// lock of the rpy representation
+    rot: [f64; 9],
+    /// How many pulses were fed since the last calibration readback
+    pulses: u32,
 }
 
 impl ServoState {
@@ -974,6 +983,9 @@ impl ServoState {
             active: false,
             vel: [0.0; 6],
             target: [0.0; 6],
+            tran: [0.0; 3],
+            rot: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            pulses: 0,
         }
     }
 }
@@ -984,13 +996,137 @@ const SERVO_PERIOD: Duration = Duration::from_millis(8);
 /// The longest wall-clock time one pulse may integrate, guards against a
 /// paused runtime sending a huge delta after a stall
 const MAX_PULSE_DT: f64 = 0.05;
+/// One pulse is fed in blocks of at most this many seconds, so a delayed
+/// tick never delivers a single delta larger than one cycle can interpolate
+const PULSE_STEP: f64 = 0.01;
 /// How long a stopped arm keeps the servo stream alive before leaving servo
 /// mode, so a resting client does not occupy the controller forever
 const IDLE_END: f64 = 0.25;
 /// The acceleration of the velocity ramp, translations in mm/s^2 and
 /// rotations in deg/s^2. Sudden stick changes become smooth speed changes
-const RAMP_LIN: f64 = 1200.0;
-const RAMP_ROT: f64 = 250.0;
+const RAMP_LIN: f64 = 800.0;
+const RAMP_ROT: f64 = 120.0;
+/// Joint filter limits of the servo NLF, in deg/s, deg/s^2 and deg/s^3.
+/// The controller smooths the joint trajectory below these caps, so a
+/// rotating move never demands more than the joints can deliver
+const NLF_VR: f64 = 150.0;
+const NLF_AR: f64 = 500.0;
+const NLF_JR: f64 = 2000.0;
+/// Read the real TCP pose back this often and resync the model when the arm
+/// stopped or drifted, every N pulses
+const CALIB_EVERY: u32 = 60;
+/// A model error above this distance or angle forces a hard resync
+const CALIB_MAX_ERR: f64 = 10.0; // mm
+const CALIB_MAX_ORI: f64 = 0.2; // radians
+
+/// A readable name for the servo error codes that abort the motion, from
+/// the SDK error code table. Joint codes carry the joint number in the
+/// high byte
+fn servo_err_hint(code: errno_t) -> String {
+    let c = code.unsigned_abs();
+    let low = c & 0xFFFF;
+    let joint = (c >> 16) as usize;
+    match low {
+        0x0030 if joint < 6 => format!("joint {} speed over limit", joint + 1),
+        0x8480 if joint < 6 => format!("joint {} forward tracking error", joint + 1),
+        0x8481 if joint < 6 => format!("joint {} reverse tracking error", joint + 1),
+        _ => match c {
+            0x0F0001 => "robot is powered off".into(),
+            0x0F0002 => "robot is disabled".into(),
+            0x0F0003 => "operation not allowed in this mode".into(),
+            0x0F0004 | 0x0F2051 => "inverse kinematics failed".into(),
+            0x0F0010 => "invalid command speed".into(),
+            0x0F0074 => "TCP speed limit reached".into(),
+            0x0F0078 => "servo enable too frequent".into(),
+            _ => format!("error code {code}"),
+        },
+    }
+}
+
+/// Rotation matrix about X, Y and Z of the base frame, row-major
+fn rot_x(a: f64) -> [f64; 9] {
+    let (c, s) = (a.cos(), a.sin());
+    [1.0, 0.0, 0.0, 0.0, c, -s, 0.0, s, c]
+}
+
+fn rot_y(a: f64) -> [f64; 9] {
+    let (c, s) = (a.cos(), a.sin());
+    [c, 0.0, s, 0.0, 1.0, 0.0, -s, 0.0, c]
+}
+
+fn rot_z(a: f64) -> [f64; 9] {
+    let (c, s) = (a.cos(), a.sin());
+    [c, -s, 0.0, s, c, 0.0, 0.0, 0.0, 1.0]
+}
+
+/// Matrix product a times b, both row-major 3x3
+fn mat_mul(a: [f64; 9], b: [f64; 9]) -> [f64; 9] {
+    let mut out = [0.0; 9];
+    for r in 0..3 {
+        for c in 0..3 {
+            out[r * 3 + c] = (0..3).map(|k| a[r * 3 + k] * b[k * 3 + c]).sum();
+        }
+    }
+    out
+}
+
+/// Rpy to matrix with the SDK convention R = Rz(rz) Ry(ry) Rx(rx)
+fn rpy_to_rot(rx: f64, ry: f64, rz: f64) -> [f64; 9] {
+    mat_mul(rot_z(rz), mat_mul(rot_y(ry), rot_x(rx)))
+}
+
+/// Matrix to rpy with the SDK convention R = Rz(rz) Ry(ry) Rx(rx). The
+/// representation locks when ry approaches +-90 degrees, the locked angle
+/// is then folded into rx with rz zeroed, matching the controller output
+fn rot_to_rpy(r: [f64; 9]) -> (f64, f64, f64) {
+    // R20 = -sin(ry), R21 = cos(ry) sin(rx), R22 = cos(ry) cos(rx)
+    let sy = (-r[6]).clamp(-1.0, 1.0);
+    let ry = sy.asin();
+    let cy = ry.cos();
+    if cy > 1e-9 {
+        let rx = r[7].atan2(r[8]);
+        // R10 = sin(rz) cos(ry), R00 = cos(rz) cos(ry)
+        let rz = r[3].atan2(r[0]);
+        (rx, ry, rz)
+    } else if ry > 0.0 {
+        // Lock at ry = +90: R01 = sin(rx - rz), R02 = cos(rx - rz)
+        let rx = r[1].atan2(r[2]);
+        (rx, ry, 0.0)
+    } else {
+        // Lock at ry = -90: R01 = -sin(rx + rz), R02 = -cos(rx + rz)
+        let rx = (-r[1]).atan2(-r[2]);
+        (rx, ry, 0.0)
+    }
+}
+
+/// The angle of the rotation between two matrices, radians
+fn rot_angle(a: [f64; 9], b: [f64; 9]) -> f64 {
+    // Trace of a * b^T is the element-wise product of a and b
+    let mut t = 0.0;
+    for i in 0..9 {
+        t += a[i] * b[i];
+    }
+    ((t - 1.0) / 2.0).clamp(-1.0, 1.0).acos()
+}
+
+/// Read the controller error state, None while the controller is normal
+fn read_robot_error(handle: &JKHD) -> Option<(errno_t, String)> {
+    let mut st = binding::RobotStatusSimple::default();
+    if unsafe { binding::get_robot_status_simple(handle, &mut st) } != binding::ERR_SUCC {
+        return None;
+    }
+    if st.errcode == 0 {
+        return None;
+    }
+    let bytes: Vec<u8> = st
+        .errmsg
+        .iter()
+        .map(|&c| c as u8)
+        .take_while(|&b| b != 0)
+        .collect();
+    let msg = String::from_utf8_lossy(&bytes).trim().to_string();
+    Some((st.errcode, msg))
+}
 
 impl Backend {
     fn is_mock(&self) -> bool {
@@ -1021,11 +1157,26 @@ impl Backend {
         match self {
             Backend::Real { handle, servo } => {
                 if !servo.active {
+                    // Set the joint filter before entering servo mode, the
+                    // controller rejects filter changes while servoing
+                    if unsafe { binding::servo_move_use_joint_NLF(handle, NLF_VR, NLF_AR, NLF_JR) }
+                        != binding::ERR_SUCC
+                    {
+                        warn!("Joint NLF filter is not supported, running without it");
+                    }
                     check("Enable servo mode", unsafe {
                         binding::servo_move_enable(handle, 1)
                     })?;
+                    // Anchor the absolute pose model on the real pose
+                    let mut tcp = CartesianPose::zero();
+                    check("Read TCP pose", unsafe {
+                        binding::get_tcp_position(handle, &mut tcp)
+                    })?;
                     servo.active = true;
                     servo.vel = [0.0; 6];
+                    servo.tran = [tcp.tran.x, tcp.tran.y, tcp.tran.z];
+                    servo.rot = rpy_to_rot(tcp.rpy.rx, tcp.rpy.ry, tcp.rpy.rz);
+                    servo.pulses = 0;
                     info!("Servo mode enabled");
                 }
                 Ok(())
@@ -1056,43 +1207,104 @@ impl Backend {
     }
 
     /// Feed one servo pulse: ramp the fed velocity toward the target and
-    /// send the position delta of the elapsed time. The mock integrates the
-    /// jog on wall-clock time instead, which is the same motion model
+    /// advance the absolute pose model, which is sent as the next command.
+    /// The orientation accumulates as a matrix, so the model stays valid
+    /// through the gimbal lock of the rpy representation. The mock
+    /// integrates the jog on wall-clock time instead, the same motion model
     fn pulse(&mut self, dt: f64) -> Result<(), String> {
         match self {
             Backend::Real { handle, servo } => {
                 if !servo.active {
                     return Ok(());
                 }
-                let mut delta = [0.0; 6];
-                for i in 0..6 {
-                    let limit = if i < 3 { RAMP_LIN } else { RAMP_ROT };
-                    let step = limit * dt;
-                    let cur = servo.vel[i];
-                    let tgt = servo.target[i];
-                    servo.vel[i] = if tgt > cur {
-                        (cur + step).min(tgt)
-                    } else {
-                        (cur - step).max(tgt)
-                    };
-                    // The SDK takes radians for the rotational deltas
-                    let v = if i < 3 {
-                        servo.vel[i]
-                    } else {
-                        servo.vel[i].to_radians()
-                    };
-                    delta[i] = v * dt;
+                let mut left = dt.min(MAX_PULSE_DT);
+                while left > 0.0 {
+                    // One block per interpolation cycle, a stalled runtime
+                    // must not deliver one huge delta in a single command
+                    let step = left.min(PULSE_STEP);
+                    let mut d = [0.0; 6];
+                    for i in 0..6 {
+                        let limit = if i < 3 { RAMP_LIN } else { RAMP_ROT };
+                        let ramp = limit * step;
+                        let cur = servo.vel[i];
+                        let tgt = servo.target[i];
+                        servo.vel[i] = if tgt > cur {
+                            (cur + ramp).min(tgt)
+                        } else {
+                            (cur - ramp).max(tgt)
+                        };
+                        d[i] = servo.vel[i] * step;
+                    }
+                    // Advance the translation and rotate about the base axes
+                    for i in 0..3 {
+                        servo.tran[i] += d[i];
+                    }
+                    if d[3] != 0.0 {
+                        servo.rot = mat_mul(rot_x(d[3].to_radians()), servo.rot);
+                    }
+                    if d[4] != 0.0 {
+                        servo.rot = mat_mul(rot_y(d[4].to_radians()), servo.rot);
+                    }
+                    if d[5] != 0.0 {
+                        servo.rot = mat_mul(rot_z(d[5].to_radians()), servo.rot);
+                    }
+                    // Send the absolute pose, the rpy is extracted from the
+                    // matrix right before the call
+                    let mut pose = CartesianPose::zero();
+                    pose.tran.x = servo.tran[0];
+                    pose.tran.y = servo.tran[1];
+                    pose.tran.z = servo.tran[2];
+                    let (rx, ry, rz) = rot_to_rpy(servo.rot);
+                    pose.rpy.rx = rx;
+                    pose.rpy.ry = ry;
+                    pose.rpy.rz = rz;
+                    let ret = unsafe { binding::servo_p(handle, &pose, MoveMode::Abs, 1) };
+                    if ret != binding::ERR_SUCC {
+                        return Err(format!("Servo pulse rejected: {}", servo_err_hint(ret)));
+                    }
+                    left -= step;
                 }
-                let mut pulse = CartesianPose::zero();
-                pulse.tran.x = delta[0];
-                pulse.tran.y = delta[1];
-                pulse.tran.z = delta[2];
-                pulse.rpy.rx = delta[3];
-                pulse.rpy.ry = delta[4];
-                pulse.rpy.rz = delta[5];
-                check("Servo move", unsafe {
-                    binding::servo_p(handle, &pulse, MoveMode::Incr, 1)
-                })
+                // Read the real pose back now and then, so a stopped arm
+                // never gets chased by a model that kept advancing
+                servo.pulses += 1;
+                if servo.pulses % CALIB_EVERY == 0 {
+                    let mut real = CartesianPose::zero();
+                    let ret = unsafe { binding::get_tcp_position(handle, &mut real) };
+                    if ret != binding::ERR_SUCC {
+                        return Err(format!(
+                            "Servo calibration read failed: {}",
+                            servo_err_hint(ret)
+                        ));
+                    }
+                    let dx = real.tran.x - servo.tran[0];
+                    let dy = real.tran.y - servo.tran[1];
+                    let dz = real.tran.z - servo.tran[2];
+                    let err = (dx * dx + dy * dy + dz * dz).sqrt();
+                    let real_rot = rpy_to_rot(real.rpy.rx, real.rpy.ry, real.rpy.rz);
+                    let ori = rot_angle(servo.rot, real_rot);
+                    if err > CALIB_MAX_ERR || ori > CALIB_MAX_ORI {
+                        warn!(
+                            "Servo model drifted {err:.1} mm / {:.1} deg from the real pose",
+                            ori.to_degrees()
+                        );
+                        // Report the controller error behind the stopped arm
+                        if let Some((code, msg)) = read_robot_error(handle) {
+                            warn!(
+                                "Controller error behind the stop: {} ({msg})",
+                                servo_err_hint(code)
+                            );
+                        }
+                        // The arm stopped following the stream. Leave servo
+                        // mode so point motions like restore are not stuck
+                        // behind it, the next vel command re-enters
+                        info!("Servo stream lost the arm, exiting servo mode");
+                        servo.active = false;
+                        servo.vel = [0.0; 6];
+                        servo.target = [0.0; 6];
+                        let _ = unsafe { binding::servo_move_enable(handle, 0) };
+                    }
+                }
+                Ok(())
             }
             Backend::Mock(state) => {
                 state.advance();
@@ -1111,9 +1323,13 @@ impl Backend {
                 servo.active = false;
                 servo.vel = [0.0; 6];
                 servo.target = [0.0; 6];
-                check("Disable servo mode", unsafe {
+                let ret = check("Disable servo mode", unsafe {
                     binding::servo_move_enable(handle, 0)
-                })
+                });
+                if ret.is_ok() {
+                    info!("Servo mode disabled");
+                }
+                ret
             }
             Backend::Mock(state) => {
                 state.advance();
@@ -1226,6 +1442,11 @@ impl Backend {
                     "enabled": st.servo_enabled != 0,
                     "joints": j,
                     "head_pos": [tcp.tran.x, tcp.tran.y, tcp.tran.z],
+                    "head_rpy": [
+                        tcp.rpy.rx.to_degrees(),
+                        tcp.rpy.ry.to_degrees(),
+                        tcp.rpy.rz.to_degrees(),
+                    ],
                 });
                 Ok(format!("status {json}\n"))
             }
@@ -1340,6 +1561,7 @@ impl MockState {
             "enabled": self.enabled,
             "joints": self.joints,
             "head_pos": [self.head[0], self.head[1], self.head[2]],
+            "head_rpy": [self.head[3], self.head[4], self.head[5]],
         });
         format!("status {json}\n")
     }
@@ -1542,6 +1764,16 @@ async fn exec_cmd(backend: &mut Backend, cmd: ProtoCmd) -> Result<String, String
         ProtoCmd::EstopClear => {
             // Leave servo mode first, it may already be gone after the e-stop
             let _ = backend.servo_end();
+            // Report the controller error before it is cleared, the e-stop
+            // button is the recovery step after a stopped servo stream
+            if let Backend::Real { handle, .. } = backend {
+                if let Some((code, msg)) = read_robot_error(handle) {
+                    warn!(
+                        "Controller error before clear: {} ({msg})",
+                        servo_err_hint(code)
+                    );
+                }
+            }
             backend.clear_error()?;
             Ok("ok\n".into())
         }
@@ -1949,5 +2181,39 @@ mod tests {
         let before = st.head[0];
         st.tick(1.0);
         assert_eq!(st.head[0], before);
+    }
+
+    #[test]
+    fn rot_rpy_roundtrip() {
+        use super::{rot_angle, rot_to_rpy, rpy_to_rot};
+        let cases = [
+            (0.1, 0.2, -0.3),
+            (0.0, 1.5707, 0.5),
+            (-1.2, 1.55, 0.7),
+            (0.0, -1.5707, -0.4),
+            (2.9, 0.0, -1.5),
+        ];
+        for (rx, ry, rz) in cases {
+            let m = rpy_to_rot(rx, ry, rz);
+            let (a, b, c) = rot_to_rpy(m);
+            let back = rpy_to_rot(a, b, c);
+            assert!(rot_angle(m, back) < 1e-6, "{rx},{ry},{rz} -> {a},{b},{c}");
+        }
+    }
+
+    #[test]
+    fn rot_z_accumulation_through_gimbal_lock() {
+        use super::{mat_mul, rot_angle, rot_to_rpy, rot_z, rpy_to_rot};
+        // Rotate about base Z in small steps starting at the lock point
+        let mut rot = rpy_to_rot(0.0, std::f64::consts::FRAC_PI_2, 0.0);
+        let step = 1.0_f64.to_radians();
+        for _ in 0..90 {
+            rot = mat_mul(rot_z(step), rot);
+            let (rx, ry, rz) = rot_to_rpy(rot);
+            let back = rpy_to_rot(rx, ry, rz);
+            assert!(rot_angle(rot, back) < 1e-6);
+            // The extracted rpy may jump near the lock, but stays finite
+            assert!(rx.is_finite() && ry.is_finite() && rz.is_finite());
+        }
     }
 }

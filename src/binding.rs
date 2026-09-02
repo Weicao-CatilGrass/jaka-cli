@@ -75,6 +75,29 @@ pub struct RobotState {
     pub servo_enabled: BOOL,
 }
 
+/// Controller error state (jktypes.h: RobotStatus_simple)
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct RobotStatusSimple {
+    /// 0 when normal, otherwise the controller error code
+    pub errcode: i32,
+    /// Controller error message
+    pub errmsg: [c_char; 200],
+    pub powered_on: i32,
+    pub enabled: i32,
+}
+
+impl Default for RobotStatusSimple {
+    fn default() -> Self {
+        Self {
+            errcode: 0,
+            errmsg: [0; 200],
+            powered_on: 0,
+            enabled: 0,
+        }
+    }
+}
+
 /// DH parameters (jktypes.h: DHParam)
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -129,6 +152,9 @@ unsafe extern "C" {
     pub fn disable_robot(handle: *const JKHD) -> errno_t;
     #[link_name = "jk_safe_get_robot_state"]
     pub fn get_robot_state(handle: *const JKHD, state: *mut RobotState) -> errno_t;
+    /// Read the controller error state and message
+    #[link_name = "jk_safe_get_robot_status_simple"]
+    pub fn get_robot_status_simple(handle: *const JKHD, status: *mut RobotStatusSimple) -> errno_t;
     #[link_name = "jk_safe_get_dh_param"]
     pub fn get_dh_param(handle: *const JKHD, dh_param: *mut DHParam) -> errno_t;
     #[link_name = "jk_safe_get_joint_position"]
@@ -205,6 +231,20 @@ unsafe extern "C" {
         move_mode: MoveMode,
         step_num: c_uint,
     ) -> errno_t;
+    /// Joint-space 3rd-order non-linear filter for servo commands, limits
+    /// the joint speed, acceleration and jerk in deg/s, deg/s^2 and deg/s^3
+    #[link_name = "jk_safe_servo_move_use_joint_NLF"]
+    pub fn servo_move_use_joint_NLF(
+        handle: *const JKHD,
+        max_vr: f64,
+        max_ar: f64,
+        max_jr: f64,
+    ) -> errno_t;
+    /// Disable the filter for servo move commands, kept to fall back when
+    /// the NLF filter misbehaves on the controller
+    #[allow(dead_code)]
+    #[link_name = "jk_safe_servo_move_use_none_filter"]
+    pub fn servo_move_use_none_filter(handle: *const JKHD) -> errno_t;
     #[link_name = "jk_safe_is_in_estop"]
     pub fn is_in_estop(handle: *const JKHD, in_estop: *mut BOOL) -> errno_t;
     #[link_name = "jk_safe_clear_error"]

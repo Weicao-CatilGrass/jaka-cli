@@ -15,6 +15,7 @@ extern "C" {
     int enable_robot(const int *handle);
     int disable_robot(const int *handle);
     int get_robot_state(const int *handle, void *state);
+    int get_robot_status_simple(const int *handle, void *status);
     int get_joint_position(const int *handle, void *pos);
     int get_tcp_position(const int *handle, void *tcp_position);
     int get_dh_param(const int *handle, void *dh_param);
@@ -27,6 +28,8 @@ extern "C" {
     int jog_stop(const int *handle, int num);
     int servo_move_enable(const int *handle, int enable);
     int servo_p(const int *handle, const void *cartesian_pose, int move_mode, unsigned int step_num);
+    int servo_move_use_joint_NLF(const int *handle, double max_vr, double max_ar, double max_jr);
+    int servo_move_use_none_filter(const int *handle);
     int is_in_estop(const int *handle, int *in_estop);
     int clear_error(const int *handle);
 }
@@ -50,6 +53,7 @@ WRAP(power_off, (const int *handle), (handle))
 WRAP(enable_robot, (const int *handle), (handle))
 WRAP(disable_robot, (const int *handle), (handle))
 WRAP(get_robot_state, (const int *handle, void *state), (handle, state))
+WRAP(get_robot_status_simple, (const int *handle, void *status), (handle, status))
 WRAP(get_joint_position, (const int *handle, void *pos), (handle, pos))
 WRAP(get_tcp_position, (const int *handle, void *tcp_position), (handle, tcp_position))
 WRAP(get_dh_param, (const int *handle, void *dh_param), (handle, dh_param))
@@ -62,5 +66,7 @@ WRAP(jog, (const int *handle, int aj_num, int move_mode, int coord_type, double 
 WRAP(jog_stop, (const int *handle, int num), (handle, num))
 WRAP(servo_move_enable, (const int *handle, int enable), (handle, enable))
 WRAP(servo_p, (const int *handle, const void *cartesian_pose, int move_mode, unsigned int step_num), (handle, cartesian_pose, move_mode, step_num))
+WRAP(servo_move_use_joint_NLF, (const int *handle, double max_vr, double max_ar, double max_jr), (handle, max_vr, max_ar, max_jr))
+WRAP(servo_move_use_none_filter, (const int *handle), (handle))
 WRAP(is_in_estop, (const int *handle, int *in_estop), (handle, in_estop))
 WRAP(clear_error, (const int *handle), (handle))

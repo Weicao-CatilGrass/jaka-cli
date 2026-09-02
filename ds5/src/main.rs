@@ -8,7 +8,7 @@ use gilrs::{Axis, Button, Gamepad, Gilrs};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Stick deflection below this value is treated as neutral
 const DEADZONE: f32 = 0.15;
@@ -18,6 +18,9 @@ const MOVE_SCALE: f32 = 100.0;
 const ROTATE_SCALE: f32 = 20.0;
 /// Shoulder button velocity in mm/s while held
 const Z_SCALE: f32 = 40.0;
+/// How often a steady velocity is resent, so the serve side recovers when
+/// its servo stream stopped on an error
+const HEARTBEAT: Duration = Duration::from_millis(500);
 
 /// Quantize a velocity to whole units and snap tiny values to zero, so a
 /// resting stick sends a stable command instead of jittering
@@ -95,6 +98,7 @@ fn main() {
     let mut prev = Input::default();
     // The velocity of the last sent vel command, NaN forces the first frame
     let mut prev_vel = [f32::NAN; 6];
+    let mut last_sent = Instant::now();
     loop {
         // Process the pending events. The gamepad mapping is only applied
         // and the cached state only updated inside next_event, without it
@@ -141,14 +145,14 @@ fn main() {
         // keeps its velocity until the next command, so a steady stick must
         // not resend the same value
         if vel != prev_vel {
-            write_cmd(
-                &mut stream,
-                &format!(
-                    "vel {:.0} {:.0} {:.0} {:.0} {:.0} {:.0}",
-                    vel[0], vel[1], vel[2], vel[3], vel[4], vel[5]
-                ),
-            );
+            send_vel(&mut stream, vel);
             prev_vel = vel;
+            last_sent = Instant::now();
+        } else if vel != [0.0; 6] && last_sent.elapsed() >= HEARTBEAT {
+            // The serve side may have stopped its servo stream on an error,
+            // resend the running velocity so it re-enters servo mode
+            send_vel(&mut stream, vel);
+            last_sent = Instant::now();
         }
         // Buttons fire once on the press edge
         if inp.cross && !prev.cross {
@@ -167,6 +171,17 @@ fn main() {
         // Scan at 100 Hz, only changed velocities produce a command
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// Send one velocity command
+fn send_vel(stream: &mut TcpStream, vel: [f32; 6]) {
+    write_cmd(
+        stream,
+        &format!(
+            "vel {:.0} {:.0} {:.0} {:.0} {:.0} {:.0}",
+            vel[0], vel[1], vel[2], vel[3], vel[4], vel[5]
+        ),
+    );
 }
 
 /// Send one protocol line without waiting for the reply, exits on write
