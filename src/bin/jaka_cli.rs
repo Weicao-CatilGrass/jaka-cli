@@ -6,7 +6,9 @@
 //! The runtime is tokio. Blocking SDK calls run on blocking tasks so the async
 //! runtime stays responsive to the Ctrl+C signal, which aborts any ongoing motion.
 
+#[path = "../binding.rs"]
 mod binding;
+#[path = "../cli.rs"]
 mod cli;
 
 use std::ffi::CString;
@@ -57,7 +59,7 @@ async fn main() -> ExitCode {
 
     // Print the static help text and exit
     if args.help {
-        print!("{}", include_str!("help.txt"));
+        print!("{}", include_str!("../help.txt"));
         return ExitCode::SUCCESS;
     }
 
@@ -426,7 +428,7 @@ async fn restore(handle: &JKHD, file: Option<&Path>, speed: f64) -> Result<(), S
     let text = match file {
         Some(path) => std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read {}: {e}", path.display()))?,
-        None => include_str!("../stat-preset/default.json").to_string(),
+        None => include_str!("../../stat-preset/default.json").to_string(),
     };
     let doc: JointsDoc = serde_json::from_str(&text).map_err(|e| format!("Invalid JSON: {e}"))?;
     if doc.joints.len() != 6 {

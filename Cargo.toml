@@ -3,6 +3,10 @@ name = "jaka-cli"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "jaka-cli"
+path = "src/bin/jaka_cli.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 env_logger = "0.11.11"
