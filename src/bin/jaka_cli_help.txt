@@ -24,14 +24,14 @@ Options:
 
 serve protocol:
   Every command is one line, the reply is ok, err <message> or status <json>
-  move <dx> <dy> <dz>       Incremental translation in mm, current pose plus offset
-  rotate <drx> <dry> <drz>  Incremental rotation in degrees, current pose plus offset
-  stop                      Abort the ongoing motion, the robot holds position
-  estop-clear               Clear the e-stop error state
-  poweron                   Power on and enable the robot
-  poweroff                  Disable servos and power off
-  reset                     Restore the built-in default pose
-  status                    Report estop, power, enable, joints and head position
+  vel <dx> <dy> <dz> <drx> <dry> <drz>
+                      Continuous velocity, translations in mm/s, rotations
+                      in deg/s. Zero stops the axis, the smooth gamepad mode
+  estop-clear         Clear the e-stop error state
+  poweron             Power on and enable the robot
+  poweroff            Disable servos and power off
+  reset               Restore the built-in default pose
+  status              Report estop, power, enable, joints and head position
 
 serve arguments:
   --port <port>   TCP port to listen on, defaults to 5533

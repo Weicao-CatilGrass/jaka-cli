@@ -17,8 +17,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use binding::{
-    BOOL, CartesianPose, CartesianTran, DHParam, JKHD, JointValue, MoveMode, OptionalCond,
-    RobotState, Rpy, check, errno_t,
+    BOOL, CartesianPose, CartesianTran, CoordType, DHParam, JKHD, JointValue, MoveMode,
+    OptionalCond, RobotState, Rpy, check, errno_t,
 };
 use clap::Parser;
 use cli::{Cli, Command};
@@ -907,14 +907,70 @@ fn set_base(handle: &JKHD) -> Result<(), String> {
 
 /// Commands of the gamepad control protocol, one command per line
 enum ProtoCmd {
-    Move(f64, f64, f64),
-    Rotate(f64, f64, f64),
-    Stop,
+    /// Continuous velocity, translations in mm/s, rotations in deg/s
+    Vel(f64, f64, f64, f64, f64, f64),
     EstopClear,
     PowerOn,
     PowerOff,
     Reset,
     Status,
+}
+
+/// Safe jog velocity limits, translations in mm/s and rotations in deg/s
+const MAX_LIN_VEL: f64 = 100.0;
+const MAX_ROT_VEL: f64 = 30.0;
+
+/// Clamp the requested velocities to the safe limits
+fn clamp_vel(v: [f64; 6]) -> [f64; 6] {
+    let mut out = [0.0; 6];
+    for i in 0..6 {
+        let limit = if i < 3 { MAX_LIN_VEL } else { MAX_ROT_VEL };
+        out[i] = v[i].clamp(-limit, limit);
+    }
+    out
+}
+
+/// Apply the new axis velocities with jog, stopping the axes that fell to
+/// zero. Translations are mm/s, rotations are deg/s in the protocol
+fn jog_axes(handle: &JKHD, last: &mut [f64; 6], v: [f64; 6]) -> Result<(), String> {
+    let v = clamp_vel(v);
+    for i in 0..6 {
+        if v[i] == 0.0 {
+            if last[i] != 0.0 {
+                check(&format!("Stop jog axis {i}"), unsafe {
+                    binding::jog_stop(handle, i as i32)
+                })?;
+            }
+        } else {
+            // The SDK takes rad/s for the rotational axes
+            let cmd = if i < 3 { v[i] } else { v[i].to_radians() };
+            check(&format!("Jog axis {i}"), unsafe {
+                binding::jog(
+                    handle,
+                    i as i32,
+                    MoveMode::Continue,
+                    CoordType::Base,
+                    cmd,
+                    0.0,
+                )
+            })?;
+        }
+    }
+    *last = v;
+    Ok(())
+}
+
+/// Stop every jog axis, used before point motions and on disconnect
+fn stop_jog(handle: &JKHD, last: &mut [f64; 6]) -> Result<(), String> {
+    for i in 0..6 {
+        if last[i] != 0.0 {
+            check(&format!("Stop jog axis {i}"), unsafe {
+                binding::jog_stop(handle, i as i32)
+            })?;
+        }
+    }
+    *last = [0.0; 6];
+    Ok(())
 }
 
 /// The backend behind the serve protocol: a real controller or a simulated
@@ -967,19 +1023,16 @@ impl MockState {
 /// Run one protocol command against the simulated state, no robot involved
 fn exec_mock(state: &mut MockState, cmd: ProtoCmd) -> Result<String, String> {
     match cmd {
-        ProtoCmd::Move(dx, dy, dz) => {
-            state.head[0] += dx;
-            state.head[1] += dy;
-            state.head[2] += dz;
+        ProtoCmd::Vel(dx, dy, dz, drx, dry, drz) => {
+            // Simulate a 50 ms control frame
+            state.head[0] += dx * 0.05;
+            state.head[1] += dy * 0.05;
+            state.head[2] += dz * 0.05;
+            state.head[3] += drx * 0.05;
+            state.head[4] += dry * 0.05;
+            state.head[5] += drz * 0.05;
             Ok("ok\n".into())
         }
-        ProtoCmd::Rotate(drx, dry, drz) => {
-            state.head[3] += drx;
-            state.head[4] += dry;
-            state.head[5] += drz;
-            Ok("ok\n".into())
-        }
-        ProtoCmd::Stop => Ok("ok\n".into()),
         ProtoCmd::EstopClear => {
             state.estop = false;
             Ok("ok\n".into())
@@ -1014,12 +1067,22 @@ fn parse_proto(line: &str) -> Result<ProtoCmd, String> {
         parts
             .get(i)
             .and_then(|s| s.parse().ok())
-            .ok_or_else(|| format!("{} expects 3 numbers", parts[0]))
+            .ok_or_else(|| format!("{} expects numeric arguments", parts[0]))
     };
     match parts[0] {
-        "move" => Ok(ProtoCmd::Move(num(1)?, num(2)?, num(3)?)),
-        "rotate" => Ok(ProtoCmd::Rotate(num(1)?, num(2)?, num(3)?)),
-        "stop" => Ok(ProtoCmd::Stop),
+        "vel" => {
+            if parts.len() != 7 {
+                return Err("vel expects 6 numbers".into());
+            }
+            Ok(ProtoCmd::Vel(
+                num(1)?,
+                num(2)?,
+                num(3)?,
+                num(4)?,
+                num(5)?,
+                num(6)?,
+            ))
+        }
         "estop-clear" => Ok(ProtoCmd::EstopClear),
         "poweron" => Ok(ProtoCmd::PowerOn),
         "poweroff" => Ok(ProtoCmd::PowerOff),
@@ -1088,8 +1151,8 @@ async fn serve(backend: Backend, port: u16, mock: bool) -> Result<(), String> {
 async fn handle_client(backend: &mut Backend, stream: TcpStream, mock: bool) -> Result<(), String> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = tokio::io::BufReader::new(reader).lines();
-    // The currently running incremental motion, aborted by the next command
-    let mut motion: Option<JoinHandle<()>> = None;
+    // The jog velocity of each axis, used to stop the axes that fell to zero
+    let mut last_vel = [0.0; 6];
     loop {
         let line = match lines.next_line().await {
             Ok(Some(l)) => l,
@@ -1103,31 +1166,27 @@ async fn handle_client(backend: &mut Backend, stream: TcpStream, mock: bool) -> 
         if mock {
             info!("[mock] {line}");
         }
-        let reply = handle_proto(backend, &mut motion, line).await;
+        let reply = handle_proto(backend, &mut last_vel, line).await;
         writer
             .write_all(reply.as_bytes())
             .await
             .map_err(|e| format!("Write reply failed: {e}"))?;
     }
-    // Disconnecting aborts any ongoing motion for safety
+    // Disconnecting stops every jog axis for safety
     if let Backend::Real(handle) = backend {
-        abort_motion(handle, &mut motion).await;
+        let _ = stop_jog(handle, &mut last_vel);
     }
     info!("Control client disconnected");
     Ok(())
 }
 
 /// Execute one protocol command and return the reply line
-async fn handle_proto(
-    backend: &mut Backend,
-    motion: &mut Option<JoinHandle<()>>,
-    line: &str,
-) -> String {
+async fn handle_proto(backend: &mut Backend, last_vel: &mut [f64; 6], line: &str) -> String {
     let cmd = match parse_proto(line) {
         Ok(c) => c,
         Err(e) => return format!("err {e}\n"),
     };
-    match exec_proto(backend, motion, cmd).await {
+    match exec_proto(backend, last_vel, cmd).await {
         Ok(reply) => reply,
         Err(e) => format!("err {e}\n"),
     }
@@ -1136,11 +1195,11 @@ async fn handle_proto(
 /// Run one parsed protocol command against the backend
 async fn exec_proto(
     backend: &mut Backend,
-    motion: &mut Option<JoinHandle<()>>,
+    last_vel: &mut [f64; 6],
     cmd: ProtoCmd,
 ) -> Result<String, String> {
     match backend {
-        Backend::Real(handle) => exec_real(handle, motion, cmd).await,
+        Backend::Real(handle) => exec_real(handle, last_vel, cmd).await,
         Backend::Mock(state) => exec_mock(state, cmd),
     }
 }
@@ -1148,29 +1207,21 @@ async fn exec_proto(
 /// Run one parsed protocol command against the real controller
 async fn exec_real(
     handle: &JKHD,
-    motion: &mut Option<JoinHandle<()>>,
+    last_vel: &mut [f64; 6],
     cmd: ProtoCmd,
 ) -> Result<String, String> {
     match cmd {
-        ProtoCmd::Move(dx, dy, dz) => {
-            start_linear(handle, motion, dx, dy, dz, 0.0, 0.0, 0.0).await;
-            Ok("ok\n".into())
-        }
-        ProtoCmd::Rotate(drx, dry, drz) => {
-            start_linear(handle, motion, 0.0, 0.0, 0.0, drx, dry, drz).await;
-            Ok("ok\n".into())
-        }
-        ProtoCmd::Stop => {
-            abort_motion(handle, motion).await;
+        ProtoCmd::Vel(dx, dy, dz, drx, dry, drz) => {
+            jog_axes(handle, last_vel, [dx, dy, dz, drx, dry, drz])?;
             Ok("ok\n".into())
         }
         ProtoCmd::EstopClear => {
-            abort_motion(handle, motion).await;
+            stop_jog(handle, last_vel)?;
             estop_clear(handle)?;
             Ok("ok\n".into())
         }
         ProtoCmd::PowerOn => {
-            abort_motion(handle, motion).await;
+            stop_jog(handle, last_vel)?;
             let mut st = RobotState::default();
             check("Read state", unsafe {
                 binding::get_robot_state(handle, &mut st)
@@ -1182,7 +1233,7 @@ async fn exec_real(
             Ok("ok\n".into())
         }
         ProtoCmd::PowerOff => {
-            abort_motion(handle, motion).await;
+            stop_jog(handle, last_vel)?;
             let mut st = RobotState::default();
             check("Read state", unsafe {
                 binding::get_robot_state(handle, &mut st)
@@ -1196,7 +1247,7 @@ async fn exec_real(
             Ok("ok\n".into())
         }
         ProtoCmd::Reset => {
-            abort_motion(handle, motion).await;
+            stop_jog(handle, last_vel)?;
             let mut st = RobotState::default();
             check("Read state", unsafe {
                 binding::get_robot_state(handle, &mut st)
@@ -1232,58 +1283,6 @@ async fn exec_real(
             Ok(format!("status {json}\n"))
         }
     }
-}
-
-/// Abort the SDK motion and wait for the background task to finish
-async fn abort_motion(handle: &JKHD, motion: &mut Option<JoinHandle<()>>) {
-    if let Some(task) = motion.take() {
-        let _ = unsafe { binding::motion_abort(handle) };
-        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
-    }
-}
-
-/// Abort the current motion and start a new incremental linear motion in the
-/// background. The reply returns immediately so the gamepad can stream the
-/// next command
-async fn start_linear(
-    handle: &JKHD,
-    motion: &mut Option<JoinHandle<()>>,
-    dx: f64,
-    dy: f64,
-    dz: f64,
-    drx: f64,
-    dry: f64,
-    drz: f64,
-) {
-    abort_motion(handle, motion).await;
-    let h = *handle;
-    let mut target = CartesianPose::zero();
-    target.tran.x = dx;
-    target.tran.y = dy;
-    target.tran.z = dz;
-    target.rpy.rx = drx.to_radians();
-    target.rpy.ry = dry.to_radians();
-    target.rpy.rz = drz.to_radians();
-    *motion = Some(tokio::spawn(async move {
-        let ret = tokio::task::spawn_blocking(move || unsafe {
-            binding::linear_move_extend(
-                &h,
-                &target,
-                MoveMode::Incr,
-                1,     // is_block: block until the motion completes
-                200.0, // mm/s, gentle for gamepad control
-                500.0, // acc, mm/s^2
-                0.0,   // tol
-                std::ptr::null::<OptionalCond>(),
-            )
-        })
-        .await;
-        match ret {
-            Ok(code) if code == binding::ERR_SUCC => {}
-            Ok(code) => warn!("Incremental motion failed: {}", binding::err_name(code)),
-            Err(e) => warn!("Incremental motion task failed: {e}"),
-        }
-    }));
 }
 
 /// Load the base pose: the saved file if present, otherwise the robot home
@@ -1530,24 +1529,18 @@ mod tests {
     use super::parse_proto;
 
     #[test]
-    fn parse_motion_commands() {
-        match parse_proto("move 10 -5 2.5").unwrap() {
-            ProtoCmd::Move(x, y, z) => {
-                assert_eq!((x, y, z), (10.0, -5.0, 2.5));
+    fn parse_vel_command() {
+        match parse_proto("vel 10 -5 2.5 0 0 -15").unwrap() {
+            ProtoCmd::Vel(dx, dy, dz, drx, dry, drz) => {
+                assert_eq!((dx, dy, dz), (10.0, -5.0, 2.5));
+                assert_eq!((drx, dry, drz), (0.0, 0.0, -15.0));
             }
-            _ => panic!("expected move"),
-        }
-        match parse_proto("rotate 0 0 -15").unwrap() {
-            ProtoCmd::Rotate(x, y, z) => {
-                assert_eq!((x, y, z), (0.0, 0.0, -15.0));
-            }
-            _ => panic!("expected rotate"),
+            _ => panic!("expected vel"),
         }
     }
 
     #[test]
     fn parse_simple_commands() {
-        assert!(matches!(parse_proto("stop").unwrap(), ProtoCmd::Stop));
         assert!(matches!(
             parse_proto("estop-clear").unwrap(),
             ProtoCmd::EstopClear
@@ -1564,9 +1557,9 @@ mod tests {
     #[test]
     fn parse_rejects_bad_lines() {
         assert!(parse_proto("").is_err());
-        assert!(parse_proto("move 1 2").is_err());
-        assert!(parse_proto("move a b c").is_err());
-        assert!(parse_proto("fly").is_err());
+        assert!(parse_proto("vel 1 2").is_err());
+        assert!(parse_proto("vel a b c d e f").is_err());
+        assert!(parse_proto("move 1 2 3").is_err());
     }
 
     #[test]
@@ -1574,14 +1567,13 @@ mod tests {
         let mut st = MockState::new();
         assert!(exec_mock(&mut st, ProtoCmd::PowerOn).is_ok());
         assert!(st.powered && st.enabled);
-        assert!(exec_mock(&mut st, ProtoCmd::Move(10.0, -5.0, 0.0)).is_ok());
-        assert_eq!(st.head[0], -40.1);
-        assert_eq!(st.head[1], -11.0);
-        assert!(exec_mock(&mut st, ProtoCmd::Rotate(0.0, 0.0, 15.0)).is_ok());
-        assert_eq!(st.head[5], 15.0);
+        assert!(exec_mock(&mut st, ProtoCmd::Vel(10.0, -5.0, 0.0, 0.0, 0.0, 0.0)).is_ok());
+        assert_eq!(st.head[0], -50.1 + 0.5);
+        assert_eq!(st.head[1], -6.0 - 0.25);
+        assert!(exec_mock(&mut st, ProtoCmd::Vel(0.0, 0.0, 0.0, 0.0, 0.0, 15.0)).is_ok());
+        assert_eq!(st.head[5], 0.75);
         let reply = exec_mock(&mut st, ProtoCmd::Status).unwrap();
         assert!(reply.contains("\"powered\":true"));
-        assert!(reply.contains("-40.1"));
         assert!(exec_mock(&mut st, ProtoCmd::Reset).is_ok());
         assert_eq!(st.head[0], -50.1);
     }

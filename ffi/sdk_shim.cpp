@@ -23,6 +23,8 @@ extern "C" {
     int joint_move_extend(const int *handle, const void *joint_pos, int move_mode, int is_block, double speed, double acc, double tol, const void *option_cond);
     int linear_move_extend(const int *handle, const void *end_pos, int move_mode, int is_block, double speed, double acc, double tol, const void *option_cond);
     int motion_abort(const int *handle);
+    int jog(const int *handle, int aj_num, int move_mode, int coord_type, double vel_cmd, double pos_cmd);
+    int jog_stop(const int *handle, int num);
     int is_in_estop(const int *handle, int *in_estop);
     int clear_error(const int *handle);
 }
@@ -54,5 +56,7 @@ WRAP(kine_forward, (const int *handle, const void *joint_pos, void *cartesian_po
 WRAP(joint_move_extend, (const int *handle, const void *joint_pos, int move_mode, int is_block, double speed, double acc, double tol, const void *option_cond), (handle, joint_pos, move_mode, is_block, speed, acc, tol, option_cond))
 WRAP(linear_move_extend, (const int *handle, const void *end_pos, int move_mode, int is_block, double speed, double acc, double tol, const void *option_cond), (handle, end_pos, move_mode, is_block, speed, acc, tol, option_cond))
 WRAP(motion_abort, (const int *handle), (handle))
+WRAP(jog, (const int *handle, int aj_num, int move_mode, int coord_type, double vel_cmd, double pos_cmd), (handle, aj_num, move_mode, coord_type, vel_cmd, pos_cmd))
+WRAP(jog_stop, (const int *handle, int num), (handle, num))
 WRAP(is_in_estop, (const int *handle, int *in_estop), (handle, in_estop))
 WRAP(clear_error, (const int *handle), (handle))

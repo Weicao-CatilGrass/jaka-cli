@@ -1,13 +1,13 @@
 jaka-ds5-control - DualSense gamepad control for the JAKA arm
 
-Reads a DualSense gamepad and streams commands to the jaka-cli serve
-protocol over TCP. This binary is a pure protocol layer, it never links
-the JAKA SDK.
+Reads a DualSense gamepad and streams velocity commands to the jaka-cli
+serve protocol over TCP. This binary is a pure protocol layer, it never
+links the JAKA SDK. The robot moves smoothly, the sticks map to velocities.
 
 Controls:
-  Left stick     Move the head in the base XY plane
-  L1 / R1        Move down / up
-  Right stick    Tilt the head (up down) and turn it (left right)
+  Left stick     Move the head in the base XY plane, up to 100 mm/s
+  L1 / R1        Move down / up at 40 mm/s
+  Right stick    Tilt the head (up down) and turn it (left right), up to 20 deg/s
   Cross          Clear the e-stop
   Triangle       Reset to the default pose
   PS button      Power on

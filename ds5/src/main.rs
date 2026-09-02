@@ -11,12 +11,12 @@ use std::time::Duration;
 
 /// Stick deflection below this value is treated as neutral
 const DEADZONE: f32 = 0.15;
-/// Stick deflection to millimeters per frame, the loop runs at 20 Hz
-const MOVE_SCALE: f32 = 4.0;
-/// Stick deflection to degrees per frame
-const ROTATE_SCALE: f32 = 3.0;
-/// Fixed millimeters per frame while a shoulder button is held
-const Z_SCALE: f32 = 4.0;
+/// Full stick deflection to velocity in mm/s
+const MOVE_SCALE: f32 = 100.0;
+/// Full stick deflection to angular velocity in deg/s
+const ROTATE_SCALE: f32 = 20.0;
+/// Shoulder button velocity in mm/s while held
+const Z_SCALE: f32 = 40.0;
 
 /// The input snapshot of one control frame
 #[derive(Default)]
@@ -75,10 +75,8 @@ fn main() {
         }
         let inp = read_input(&gp);
 
-        // Motion commands stream every frame while a stick or button is
-        // held, releasing it stops the stream and the robot holds. The XY
-        // stick and the shoulder Z merge into one move so they do not
-        // abort each other
+        // Velocity commands stream every frame, axes at zero stop. The
+        // right stick tilts the head around X and turns it around Z
         let dx = if inp.stick_x.abs() > DEADZONE {
             inp.stick_x * MOVE_SCALE
         } else {
@@ -97,14 +95,6 @@ fn main() {
         } else {
             0.0
         };
-        if dx != 0.0 || dy != 0.0 || dz != 0.0 {
-            send(
-                &mut stream,
-                &mut reader,
-                &format!("move {dx:.1} {dy:.1} {dz:.1}"),
-            );
-        }
-        // The right stick tilts the head around X and turns it around Z
         let drx = if inp.rot_y.abs() > DEADZONE {
             inp.rot_y * ROTATE_SCALE
         } else {
@@ -115,13 +105,11 @@ fn main() {
         } else {
             0.0
         };
-        if drx != 0.0 || drz != 0.0 {
-            send(
-                &mut stream,
-                &mut reader,
-                &format!("rotate {drx:.1} 0 {drz:.1}"),
-            );
-        }
+        send(
+            &mut stream,
+            &mut reader,
+            &format!("vel {dx:.1} {dy:.1} {dz:.1} {drx:.1} 0 {drz:.1}"),
+        );
         // Buttons fire once on the press edge
         if inp.cross && !prev.cross {
             send(&mut stream, &mut reader, "estop-clear");

@@ -87,12 +87,21 @@ pub struct DHParam {
 
 /// Motion mode (jktypes.h: MoveMode)
 #[repr(i32)]
-#[allow(dead_code)] // Abs/Continue are not used yet but kept to mirror the header
 #[derive(Clone, Copy, Debug)]
 pub enum MoveMode {
     Abs = 0,
     Incr = 1,
     Continue = 2,
+}
+
+/// Coordinate system (jktypes.h: CoordType)
+#[repr(i32)]
+#[allow(dead_code)] // Joint/Tool are not used yet but kept to mirror the header
+#[derive(Clone, Copy, Debug)]
+pub enum CoordType {
+    Base = 0,
+    Joint = 1,
+    Tool = 2,
 }
 
 /// Optional motion parameters, always null in this project (jktypes.h: OptionalCond)
@@ -165,6 +174,19 @@ unsafe extern "C" {
     /// Stop all ongoing movements of the cobot
     #[link_name = "jk_safe_motion_abort"]
     pub fn motion_abort(handle: *const JKHD) -> errno_t;
+    /// Continuous velocity control of one axis, the smooth gamepad mode
+    #[link_name = "jk_safe_jog"]
+    pub fn jog(
+        handle: *const JKHD,
+        aj_num: i32,
+        move_mode: MoveMode,
+        coord_type: CoordType,
+        vel_cmd: f64,
+        pos_cmd: f64,
+    ) -> errno_t;
+    /// Stop the ongoing jog movement of one axis
+    #[link_name = "jk_safe_jog_stop"]
+    pub fn jog_stop(handle: *const JKHD, num: i32) -> errno_t;
     #[link_name = "jk_safe_is_in_estop"]
     pub fn is_in_estop(handle: *const JKHD, in_estop: *mut BOOL) -> errno_t;
     #[link_name = "jk_safe_clear_error"]
