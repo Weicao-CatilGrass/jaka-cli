@@ -25,6 +25,8 @@ extern "C" {
     int motion_abort(const int *handle);
     int jog(const int *handle, int aj_num, int move_mode, int coord_type, double vel_cmd, double pos_cmd);
     int jog_stop(const int *handle, int num);
+    int servo_move_enable(const int *handle, int enable);
+    int servo_p(const int *handle, const void *cartesian_pose, int move_mode, unsigned int step_num);
     int is_in_estop(const int *handle, int *in_estop);
     int clear_error(const int *handle);
 }
@@ -58,5 +60,7 @@ WRAP(linear_move_extend, (const int *handle, const void *end_pos, int move_mode,
 WRAP(motion_abort, (const int *handle), (handle))
 WRAP(jog, (const int *handle, int aj_num, int move_mode, int coord_type, double vel_cmd, double pos_cmd), (handle, aj_num, move_mode, coord_type, vel_cmd, pos_cmd))
 WRAP(jog_stop, (const int *handle, int num), (handle, num))
+WRAP(servo_move_enable, (const int *handle, int enable), (handle, enable))
+WRAP(servo_p, (const int *handle, const void *cartesian_pose, int move_mode, unsigned int step_num), (handle, cartesian_pose, move_mode, step_num))
 WRAP(is_in_estop, (const int *handle, int *in_estop), (handle, in_estop))
 WRAP(clear_error, (const int *handle), (handle))

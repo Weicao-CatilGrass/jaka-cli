@@ -9,7 +9,7 @@
 //! The shared library is linked by build.rs from
 //! sdk/Linux/c&c++/x86_64-linux-gnu/shared/libjakaAPI.so.
 
-use std::ffi::{c_char, c_void};
+use std::ffi::{c_char, c_uint, c_void};
 
 /// Robot control handle (jktypes.h: JKHD)
 pub type JKHD = i32;
@@ -88,6 +88,7 @@ pub struct DHParam {
 /// Motion mode (jktypes.h: MoveMode)
 #[repr(i32)]
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)] // Continue is only used by the kept single-axis jog API
 pub enum MoveMode {
     Abs = 0,
     Incr = 1,
@@ -174,7 +175,10 @@ unsafe extern "C" {
     /// Stop all ongoing movements of the cobot
     #[link_name = "jk_safe_motion_abort"]
     pub fn motion_abort(handle: *const JKHD) -> errno_t;
-    /// Continuous velocity control of one axis, the smooth gamepad mode
+    /// Continuous velocity control of one axis. Kept because a jog call
+    /// preempts the previous motion, so the serve protocol uses servo mode
+    /// instead and this API is no longer called
+    #[allow(dead_code)]
     #[link_name = "jk_safe_jog"]
     pub fn jog(
         handle: *const JKHD,
@@ -185,8 +189,22 @@ unsafe extern "C" {
         pos_cmd: f64,
     ) -> errno_t;
     /// Stop the ongoing jog movement of one axis
+    #[allow(dead_code)]
     #[link_name = "jk_safe_jog_stop"]
     pub fn jog_stop(handle: *const JKHD, num: i32) -> errno_t;
+    /// Enter or leave servo mode, the smooth multi-axis control mode
+    #[link_name = "jk_safe_servo_move_enable"]
+    pub fn servo_move_enable(handle: *const JKHD, enable: BOOL) -> errno_t;
+    /// One servo interpolation cycle of Cartesian motion, the pose is an
+    /// absolute target in ABS mode or a delta in INCR mode, translations in
+    /// mm and rotations in radians. step_num times 8 ms is the cycle period
+    #[link_name = "jk_safe_servo_p"]
+    pub fn servo_p(
+        handle: *const JKHD,
+        pose: *const CartesianPose,
+        move_mode: MoveMode,
+        step_num: c_uint,
+    ) -> errno_t;
     #[link_name = "jk_safe_is_in_estop"]
     pub fn is_in_estop(handle: *const JKHD, in_estop: *mut BOOL) -> errno_t;
     #[link_name = "jk_safe_clear_error"]

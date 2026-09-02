@@ -7,6 +7,7 @@
 use gilrs::{Axis, Button, Gamepad, Gilrs};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
+use std::thread;
 use std::time::Duration;
 
 /// Stick deflection below this value is treated as neutral
@@ -59,8 +60,29 @@ fn main() {
     let (ip, port) = parse_args();
     let mut stream = TcpStream::connect((ip.as_str(), port))
         .unwrap_or_else(|e| die(&format!("connect {ip}:{port} failed: {e}")));
-    let mut reader = BufReader::new(stream.try_clone().expect("clone the stream"));
     println!("connected to {ip}:{port}");
+
+    // A background thread consumes the replies so the control loop never
+    // blocks on the network round trip. Non-ok replies surface serve side
+    // errors, a closed connection exits the program
+    let reply_stream = stream.try_clone().expect("clone the stream");
+    thread::spawn(move || {
+        let mut lines = BufReader::new(reply_stream).lines();
+        loop {
+            let line = match lines.next() {
+                Some(Ok(l)) => l,
+                // The stream ended or failed, the serve side is gone
+                None | Some(Err(_)) => die("serve connection closed"),
+            };
+            let reply = line.trim();
+            if reply.is_empty() {
+                continue;
+            }
+            if reply != "ok" {
+                eprintln!("serve: {reply}");
+            }
+        }
+    });
 
     let mut gilrs = Gilrs::new().unwrap_or_else(|e| die(&format!("gamepad init failed: {e}")));
     let gp_id = gilrs
@@ -114,12 +136,13 @@ fn main() {
             0.0
         };
         let vel = [dx, dy, dz, drx, 0.0, drz];
-        // Send only the changes: a jog axis keeps its velocity until the
-        // next command, so a steady stick must not resend the same value
+        // All inputs merge into one velocity command, so moving, lifting and
+        // rotating happen at the same time. Send only the changes: a jog axis
+        // keeps its velocity until the next command, so a steady stick must
+        // not resend the same value
         if vel != prev_vel {
-            send(
+            write_cmd(
                 &mut stream,
-                &mut reader,
                 &format!(
                     "vel {:.0} {:.0} {:.0} {:.0} {:.0} {:.0}",
                     vel[0], vel[1], vel[2], vel[3], vel[4], vel[5]
@@ -129,16 +152,16 @@ fn main() {
         }
         // Buttons fire once on the press edge
         if inp.cross && !prev.cross {
-            send(&mut stream, &mut reader, "estop-clear");
+            write_cmd(&mut stream, "estop-clear");
         }
         if inp.triangle && !prev.triangle {
-            send(&mut stream, &mut reader, "reset");
+            write_cmd(&mut stream, "reset");
         }
         if inp.ps && !prev.ps {
-            send(&mut stream, &mut reader, "poweron");
+            write_cmd(&mut stream, "poweron");
         }
         if inp.select && !prev.select {
-            send(&mut stream, &mut reader, "poweroff");
+            write_cmd(&mut stream, "poweroff");
         }
         prev = inp;
         // Scan at 100 Hz, only changed velocities produce a command
@@ -146,19 +169,11 @@ fn main() {
     }
 }
 
-/// Send one protocol line and read the reply, exits when the link fails
-fn send(stream: &mut TcpStream, reader: &mut BufReader<TcpStream>, cmd: &str) {
+/// Send one protocol line without waiting for the reply, exits on write
+/// failure. The reply thread reports serve side errors
+fn write_cmd(stream: &mut TcpStream, cmd: &str) {
     if stream.write_all(cmd.as_bytes()).is_err() || stream.write_all(b"\n").is_err() {
         die("write failed, is jaka-cli serve running?");
-    }
-    let mut line = String::new();
-    match reader.read_line(&mut line) {
-        Ok(0) | Err(_) => die("read failed, is jaka-cli serve running?"),
-        Ok(_) => {}
-    }
-    let reply = line.trim();
-    if reply != "ok" {
-        eprintln!("{cmd}: {reply}");
     }
 }
 

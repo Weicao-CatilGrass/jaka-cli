@@ -13,6 +13,9 @@ Controls:
   PS button      Power on
   Select         Power off
 
+  All inputs merge into one velocity command, so moving, lifting and
+  rotating can happen at the same time.
+
 Usage:
   jaka-ds5-control [options]
 
