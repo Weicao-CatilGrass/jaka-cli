@@ -6,7 +6,9 @@ fn main() {
 
     match target_os.as_str() {
         "linux" => {
-            let static_lib = "sdk/Linux/c&c++/x86_64-linux-gnu/static";
+            // The committed minimal SDK, so the build works without the full
+            // SDK download. The full sdk/ tree stays a local fallback
+            let static_lib = "sdk-lib/linux";
             let shared_lib = "sdk/Linux/c&c++/x86_64-linux-gnu/shared";
             // Prefer the static lib so the result is a single binary. Fall back
             // to the shared lib with a relative rpath when the static lib is absent
@@ -24,7 +26,7 @@ fn main() {
             }
         }
         "windows" => {
-            let sdk_x64 = "sdk/Windows/c&c++/x64";
+            let sdk_x64 = "sdk-lib/win";
             println!("cargo:rustc-link-search=native={sdk_x64}");
             // The Windows loader only finds jakaAPI.dll next to the exe or on
             // PATH, so copy it to the build profile directory
