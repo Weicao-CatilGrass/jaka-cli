@@ -10,8 +10,8 @@ Controls:
   Right stick    Tilt the head (up down) and turn it (left right), up to 20 deg/s
   Cross          Clear the e-stop
   Triangle       Reset to the default pose
-  PS button      Power on
-  Select         Power off
+  D-pad up       Power on
+  D-pad down     Power off
 
   All inputs merge into one velocity command, so moving, lifting and
   rotating can happen at the same time.

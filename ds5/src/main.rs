@@ -37,8 +37,8 @@ struct Input {
     shoulder_r: bool,
     cross: bool,
     triangle: bool,
-    ps: bool,
-    select: bool,
+    dpad_up: bool,
+    dpad_down: bool,
 }
 
 fn read_input(gp: &Gamepad) -> Input {
@@ -51,8 +51,8 @@ fn read_input(gp: &Gamepad) -> Input {
         shoulder_r: gp.is_pressed(Button::RightTrigger),
         cross: gp.is_pressed(Button::South),
         triangle: gp.is_pressed(Button::North),
-        ps: gp.is_pressed(Button::Mode),
-        select: gp.is_pressed(Button::Select),
+        dpad_up: gp.is_pressed(Button::DPadUp),
+        dpad_down: gp.is_pressed(Button::DPadDown),
     }
 }
 
@@ -157,10 +157,10 @@ fn main() {
         if inp.triangle && !prev.triangle {
             write_cmd(&mut stream, "reset");
         }
-        if inp.ps && !prev.ps {
+        if inp.dpad_up && !prev.dpad_up {
             write_cmd(&mut stream, "poweron");
         }
-        if inp.select && !prev.select {
+        if inp.dpad_down && !prev.dpad_down {
             write_cmd(&mut stream, "poweroff");
         }
         prev = inp;
