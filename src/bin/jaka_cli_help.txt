@@ -15,11 +15,28 @@ Commands:
   restore     Restore the joint angles recorded by inspect from a JSON file
   move-to     Move the TCP to an absolute position, or with --rel to base plus an offset
   set-base    Save the current TCP position as the base pose for move-to --rel
+  serve       Serve a TCP control protocol for a gamepad
 
 Options:
   --ip <IP>       Controller IP address, defaults to 10.5.5.100
   --dry-run       Print the plan without connecting
   -h, --help      Show this help
+
+serve protocol:
+  Every command is one line, the reply is ok, err <message> or status <json>
+  move <dx> <dy> <dz>       Incremental translation in mm, current pose plus offset
+  rotate <drx> <dry> <drz>  Incremental rotation in degrees, current pose plus offset
+  stop                      Abort the ongoing motion, the robot holds position
+  estop-clear               Clear the e-stop error state
+  poweron                   Power on and enable the robot
+  poweroff                  Disable servos and power off
+  reset                     Restore the built-in default pose
+  status                    Report estop, power, enable, joints and head position
+
+serve arguments:
+  --port <port>   TCP port to listen on, defaults to 9000
+  --mock          Run without a controller, print the commands and reply
+                  with a simulated state for testing the client side
 
 rot arguments:
   --joint <1-6>   Joint to rotate, from 1 to 6, defaults to 6

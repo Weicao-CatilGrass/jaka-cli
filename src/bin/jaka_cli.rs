@@ -1,6 +1,6 @@
 //! JAKA robotic arm driver.
 //!
-//! Usage is documented in src/help.txt and printed by `jaka-cli --help`.
+//! Usage is documented in src/bin/jaka_cli_help.txt and printed by `jaka-cli --help`.
 //! The log level is controlled by the RUST_LOG environment variable and defaults to info.
 //!
 //! The runtime is tokio. Blocking SDK calls run on blocking tasks so the async
@@ -24,6 +24,9 @@ use clap::Parser;
 use cli::{Cli, Command};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinHandle;
 
 /// TCP pose document as written by inspect-pos
 #[derive(Deserialize)]
@@ -59,13 +62,13 @@ async fn main() -> ExitCode {
 
     // Print the static help text and exit
     if args.help {
-        print!("{}", include_str!("../help.txt"));
+        print!("{}", include_str!("jaka_cli_help.txt"));
         return ExitCode::SUCCESS;
     }
 
     let Some(command) = &args.command else {
         error!(
-            "No subcommand given. Expected one of status, power-on, power-off, estop-clear, inspect, inspect-pos, dh, set-base, rot, restore, move-to. Use --help for usage"
+            "No subcommand given. Expected one of status, power-on, power-off, estop-clear, inspect, inspect-pos, dh, set-base, rot, restore, move-to, serve. Use --help for usage"
         );
         return ExitCode::FAILURE;
     };
@@ -180,10 +183,29 @@ fn print_plan(args: &Cli, command: &Command) {
             "[dry-run] Will connect to controller {} and save the current TCP as the base pose",
             args.ip
         ),
+        Command::Serve { port, mock } => {
+            if *mock {
+                info!(
+                    "[dry-run] Will serve the gamepad protocol on port {port} without a controller"
+                );
+            } else {
+                info!(
+                    "[dry-run] Will connect to controller {} and serve the gamepad protocol on port {port}",
+                    args.ip
+                );
+            }
+        }
     }
 }
 
 async fn run(args: &Cli, command: &Command) -> Result<(), String> {
+    // The mock serve runs without a controller, only the protocol matters
+    if let Command::Serve { port, mock } = command {
+        if *mock {
+            return serve(Backend::Mock(MockState::new()), *port, true).await;
+        }
+    }
+
     let ip = CString::new(args.ip.as_str()).map_err(|_| "IP contains invalid characters")?;
 
     // Keep SDK printf noise off stdout for the whole session. Machine-readable
@@ -198,7 +220,10 @@ async fn run(args: &Cli, command: &Command) -> Result<(), String> {
     info!("Connected to controller {}", args.ip);
 
     // Always disconnect, even when the operation below fails
-    let result = drive(&handle, command, stdout_fd).await;
+    let result = match command {
+        Command::Serve { port, .. } => serve(Backend::Real(handle), *port, false).await,
+        _ => drive(&handle, command, stdout_fd).await,
+    };
     let ret = unsafe { binding::destory_handler(&handle) };
     if ret != binding::ERR_SUCC {
         error!("Disconnect failed with error code {ret}");
@@ -269,6 +294,11 @@ async fn drive(handle: &JKHD, command: &Command, stdout_fd: i32) -> Result<(), S
                 info!("Already powered off");
             }
             Ok(())
+        }
+        Command::Serve { .. } => {
+            // The serve subcommand is dispatched before drive, this arm is
+            // unreachable but the match must stay exhaustive
+            Err("serve is not a drive command".into())
         }
         Command::PowerOn
         | Command::Rot { .. }
@@ -875,6 +905,360 @@ fn set_base(handle: &JKHD) -> Result<(), String> {
     Ok(())
 }
 
+/// Commands of the gamepad control protocol, one command per line
+enum ProtoCmd {
+    Move(f64, f64, f64),
+    Rotate(f64, f64, f64),
+    Stop,
+    EstopClear,
+    PowerOn,
+    PowerOff,
+    Reset,
+    Status,
+}
+
+/// The backend behind the serve protocol: a real controller or a simulated
+/// state for testing the client side without the robot
+#[derive(Clone, Copy)]
+enum Backend {
+    Real(JKHD),
+    Mock(MockState),
+}
+
+/// Simulated robot state for serve --mock
+#[derive(Clone, Copy)]
+struct MockState {
+    powered: bool,
+    enabled: bool,
+    estop: bool,
+    /// TCP x y z in mm and rx ry rz in degrees, the home pose at startup
+    head: [f64; 6],
+    /// Joint angles in degrees, the default pose at startup
+    joints: [f64; 6],
+}
+
+impl MockState {
+    fn new() -> Self {
+        Self {
+            powered: false,
+            enabled: false,
+            estop: false,
+            head: [-50.1, -6.0, 396.8, 0.0, 90.0, 0.0],
+            joints: [0.0, 90.0, -90.0, 0.0, -90.0, 0.0],
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    fn status_json(&self) -> String {
+        let json = serde_json::json!({
+            "estop": self.estop,
+            "powered": self.powered,
+            "enabled": self.enabled,
+            "joints": self.joints,
+            "head_pos": [self.head[0], self.head[1], self.head[2]],
+        });
+        format!("status {json}\n")
+    }
+}
+
+/// Run one protocol command against the simulated state, no robot involved
+fn exec_mock(state: &mut MockState, cmd: ProtoCmd) -> Result<String, String> {
+    match cmd {
+        ProtoCmd::Move(dx, dy, dz) => {
+            state.head[0] += dx;
+            state.head[1] += dy;
+            state.head[2] += dz;
+            Ok("ok\n".into())
+        }
+        ProtoCmd::Rotate(drx, dry, drz) => {
+            state.head[3] += drx;
+            state.head[4] += dry;
+            state.head[5] += drz;
+            Ok("ok\n".into())
+        }
+        ProtoCmd::Stop => Ok("ok\n".into()),
+        ProtoCmd::EstopClear => {
+            state.estop = false;
+            Ok("ok\n".into())
+        }
+        ProtoCmd::PowerOn => {
+            state.powered = true;
+            state.enabled = true;
+            Ok("ok\n".into())
+        }
+        ProtoCmd::PowerOff => {
+            state.enabled = false;
+            state.powered = false;
+            Ok("ok\n".into())
+        }
+        ProtoCmd::Reset => {
+            state.reset();
+            state.powered = true;
+            state.enabled = true;
+            Ok("ok\n".into())
+        }
+        ProtoCmd::Status => Ok(state.status_json()),
+    }
+}
+
+/// Parse one protocol line: the command name followed by space separated numbers
+fn parse_proto(line: &str) -> Result<ProtoCmd, String> {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.is_empty() {
+        return Err("empty line".into());
+    }
+    let num = |i: usize| -> Result<f64, String> {
+        parts
+            .get(i)
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| format!("{} expects 3 numbers", parts[0]))
+    };
+    match parts[0] {
+        "move" => Ok(ProtoCmd::Move(num(1)?, num(2)?, num(3)?)),
+        "rotate" => Ok(ProtoCmd::Rotate(num(1)?, num(2)?, num(3)?)),
+        "stop" => Ok(ProtoCmd::Stop),
+        "estop-clear" => Ok(ProtoCmd::EstopClear),
+        "poweron" => Ok(ProtoCmd::PowerOn),
+        "poweroff" => Ok(ProtoCmd::PowerOff),
+        "reset" => Ok(ProtoCmd::Reset),
+        "status" => Ok(ProtoCmd::Status),
+        other => Err(format!("unknown command: {other}")),
+    }
+}
+
+/// Serve the gamepad control protocol over TCP. Incremental motion commands
+/// abort the previous motion and start a new one, so the gamepad can stream
+/// commands at its own frame rate
+async fn serve(backend: Backend, port: u16, mock: bool) -> Result<(), String> {
+    let listener = TcpListener::bind(("0.0.0.0", port))
+        .await
+        .map_err(|e| format!("Bind port {port} failed: {e}"))?;
+    if mock {
+        info!("Mock control server listening on port {port}, no controller involved");
+    } else {
+        info!("Control server listening on port {port}");
+    }
+    loop {
+        let (stream, addr) = listener
+            .accept()
+            .await
+            .map_err(|e| format!("Accept failed: {e}"))?;
+        info!("Control client connected from {addr}");
+        let mut backend = backend.clone();
+        let mock = mock;
+        tokio::spawn(async move {
+            if let Err(e) = handle_client(&mut backend, stream, mock).await {
+                warn!("Control client {addr} error: {e}");
+            }
+        });
+    }
+}
+
+/// Serve one control client: read protocol lines, reply to each command
+async fn handle_client(backend: &mut Backend, stream: TcpStream, mock: bool) -> Result<(), String> {
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = tokio::io::BufReader::new(reader).lines();
+    // The currently running incremental motion, aborted by the next command
+    let mut motion: Option<JoinHandle<()>> = None;
+    loop {
+        let line = match lines.next_line().await {
+            Ok(Some(l)) => l,
+            Ok(None) => break,
+            Err(e) => return Err(format!("Read line failed: {e}")),
+        };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if mock {
+            info!("[mock] {line}");
+        }
+        let reply = handle_proto(backend, &mut motion, line).await;
+        writer
+            .write_all(reply.as_bytes())
+            .await
+            .map_err(|e| format!("Write reply failed: {e}"))?;
+    }
+    // Disconnecting aborts any ongoing motion for safety
+    if let Backend::Real(handle) = backend {
+        abort_motion(handle, &mut motion).await;
+    }
+    info!("Control client disconnected");
+    Ok(())
+}
+
+/// Execute one protocol command and return the reply line
+async fn handle_proto(
+    backend: &mut Backend,
+    motion: &mut Option<JoinHandle<()>>,
+    line: &str,
+) -> String {
+    let cmd = match parse_proto(line) {
+        Ok(c) => c,
+        Err(e) => return format!("err {e}\n"),
+    };
+    match exec_proto(backend, motion, cmd).await {
+        Ok(reply) => reply,
+        Err(e) => format!("err {e}\n"),
+    }
+}
+
+/// Run one parsed protocol command against the backend
+async fn exec_proto(
+    backend: &mut Backend,
+    motion: &mut Option<JoinHandle<()>>,
+    cmd: ProtoCmd,
+) -> Result<String, String> {
+    match backend {
+        Backend::Real(handle) => exec_real(handle, motion, cmd).await,
+        Backend::Mock(state) => exec_mock(state, cmd),
+    }
+}
+
+/// Run one parsed protocol command against the real controller
+async fn exec_real(
+    handle: &JKHD,
+    motion: &mut Option<JoinHandle<()>>,
+    cmd: ProtoCmd,
+) -> Result<String, String> {
+    match cmd {
+        ProtoCmd::Move(dx, dy, dz) => {
+            start_linear(handle, motion, dx, dy, dz, 0.0, 0.0, 0.0).await;
+            Ok("ok\n".into())
+        }
+        ProtoCmd::Rotate(drx, dry, drz) => {
+            start_linear(handle, motion, 0.0, 0.0, 0.0, drx, dry, drz).await;
+            Ok("ok\n".into())
+        }
+        ProtoCmd::Stop => {
+            abort_motion(handle, motion).await;
+            Ok("ok\n".into())
+        }
+        ProtoCmd::EstopClear => {
+            abort_motion(handle, motion).await;
+            estop_clear(handle)?;
+            Ok("ok\n".into())
+        }
+        ProtoCmd::PowerOn => {
+            abort_motion(handle, motion).await;
+            let mut st = RobotState::default();
+            check("Read state", unsafe {
+                binding::get_robot_state(handle, &mut st)
+            })?;
+            if st.estoped != 0 {
+                return Err("E-stop is pressed, release the button first".into());
+            }
+            ensure_powered_enabled(handle, &st)?;
+            Ok("ok\n".into())
+        }
+        ProtoCmd::PowerOff => {
+            abort_motion(handle, motion).await;
+            let mut st = RobotState::default();
+            check("Read state", unsafe {
+                binding::get_robot_state(handle, &mut st)
+            })?;
+            if st.servo_enabled != 0 {
+                check("Disable servos", unsafe { binding::disable_robot(handle) })?;
+            }
+            if st.powered_on != 0 {
+                check("Power off", unsafe { binding::power_off(handle) })?;
+            }
+            Ok("ok\n".into())
+        }
+        ProtoCmd::Reset => {
+            abort_motion(handle, motion).await;
+            let mut st = RobotState::default();
+            check("Read state", unsafe {
+                binding::get_robot_state(handle, &mut st)
+            })?;
+            if st.estoped != 0 {
+                return Err("E-stop is pressed, release the button first".into());
+            }
+            ensure_powered_enabled(handle, &st)?;
+            restore(handle, None, 3.14).await?;
+            Ok("ok\n".into())
+        }
+        ProtoCmd::Status => {
+            let mut st = RobotState::default();
+            check("Read state", unsafe {
+                binding::get_robot_state(handle, &mut st)
+            })?;
+            let mut joints = JointValue::zero();
+            check("Read joint position", unsafe {
+                binding::get_joint_position(handle, &mut joints)
+            })?;
+            let mut tcp = CartesianPose::zero();
+            check("Read TCP position", unsafe {
+                binding::get_tcp_position(handle, &mut tcp)
+            })?;
+            let j: Vec<f64> = joints.j_val.iter().map(|v| v.to_degrees()).collect();
+            let json = serde_json::json!({
+                "estop": st.estoped != 0,
+                "powered": st.powered_on != 0,
+                "enabled": st.servo_enabled != 0,
+                "joints": j,
+                "head_pos": [tcp.tran.x, tcp.tran.y, tcp.tran.z],
+            });
+            Ok(format!("status {json}\n"))
+        }
+    }
+}
+
+/// Abort the SDK motion and wait for the background task to finish
+async fn abort_motion(handle: &JKHD, motion: &mut Option<JoinHandle<()>>) {
+    if let Some(task) = motion.take() {
+        let _ = unsafe { binding::motion_abort(handle) };
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+}
+
+/// Abort the current motion and start a new incremental linear motion in the
+/// background. The reply returns immediately so the gamepad can stream the
+/// next command
+async fn start_linear(
+    handle: &JKHD,
+    motion: &mut Option<JoinHandle<()>>,
+    dx: f64,
+    dy: f64,
+    dz: f64,
+    drx: f64,
+    dry: f64,
+    drz: f64,
+) {
+    abort_motion(handle, motion).await;
+    let h = *handle;
+    let mut target = CartesianPose::zero();
+    target.tran.x = dx;
+    target.tran.y = dy;
+    target.tran.z = dz;
+    target.rpy.rx = drx.to_radians();
+    target.rpy.ry = dry.to_radians();
+    target.rpy.rz = drz.to_radians();
+    *motion = Some(tokio::spawn(async move {
+        let ret = tokio::task::spawn_blocking(move || unsafe {
+            binding::linear_move_extend(
+                &h,
+                &target,
+                MoveMode::Incr,
+                1,     // is_block: block until the motion completes
+                200.0, // mm/s, gentle for gamepad control
+                500.0, // acc, mm/s^2
+                0.0,   // tol
+                std::ptr::null::<OptionalCond>(),
+            )
+        })
+        .await;
+        match ret {
+            Ok(code) if code == binding::ERR_SUCC => {}
+            Ok(code) => warn!("Incremental motion failed: {}", binding::err_name(code)),
+            Err(e) => warn!("Incremental motion task failed: {e}"),
+        }
+    }));
+}
+
 /// Load the base pose: the saved file if present, otherwise the robot home
 /// position computed with forward kinematics at zero joints
 fn load_base(handle: &JKHD) -> Result<(CartesianPose, bool), String> {
@@ -1109,4 +1493,69 @@ fn fmt_array(vals: &[f64; 6]) -> String {
         .map(|v| format!("{:.3}", v.to_degrees()))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MockState;
+    use super::ProtoCmd;
+    use super::exec_mock;
+    use super::parse_proto;
+
+    #[test]
+    fn parse_motion_commands() {
+        match parse_proto("move 10 -5 2.5").unwrap() {
+            ProtoCmd::Move(x, y, z) => {
+                assert_eq!((x, y, z), (10.0, -5.0, 2.5));
+            }
+            _ => panic!("expected move"),
+        }
+        match parse_proto("rotate 0 0 -15").unwrap() {
+            ProtoCmd::Rotate(x, y, z) => {
+                assert_eq!((x, y, z), (0.0, 0.0, -15.0));
+            }
+            _ => panic!("expected rotate"),
+        }
+    }
+
+    #[test]
+    fn parse_simple_commands() {
+        assert!(matches!(parse_proto("stop").unwrap(), ProtoCmd::Stop));
+        assert!(matches!(
+            parse_proto("estop-clear").unwrap(),
+            ProtoCmd::EstopClear
+        ));
+        assert!(matches!(parse_proto("poweron").unwrap(), ProtoCmd::PowerOn));
+        assert!(matches!(
+            parse_proto("poweroff").unwrap(),
+            ProtoCmd::PowerOff
+        ));
+        assert!(matches!(parse_proto("reset").unwrap(), ProtoCmd::Reset));
+        assert!(matches!(parse_proto("status").unwrap(), ProtoCmd::Status));
+    }
+
+    #[test]
+    fn parse_rejects_bad_lines() {
+        assert!(parse_proto("").is_err());
+        assert!(parse_proto("move 1 2").is_err());
+        assert!(parse_proto("move a b c").is_err());
+        assert!(parse_proto("fly").is_err());
+    }
+
+    #[test]
+    fn mock_state_moves_and_reports() {
+        let mut st = MockState::new();
+        assert!(exec_mock(&mut st, ProtoCmd::PowerOn).is_ok());
+        assert!(st.powered && st.enabled);
+        assert!(exec_mock(&mut st, ProtoCmd::Move(10.0, -5.0, 0.0)).is_ok());
+        assert_eq!(st.head[0], -40.1);
+        assert_eq!(st.head[1], -11.0);
+        assert!(exec_mock(&mut st, ProtoCmd::Rotate(0.0, 0.0, 15.0)).is_ok());
+        assert_eq!(st.head[5], 15.0);
+        let reply = exec_mock(&mut st, ProtoCmd::Status).unwrap();
+        assert!(reply.contains("\"powered\":true"));
+        assert!(reply.contains("-40.1"));
+        assert!(exec_mock(&mut st, ProtoCmd::Reset).is_ok());
+        assert_eq!(st.head[0], -50.1);
+    }
 }

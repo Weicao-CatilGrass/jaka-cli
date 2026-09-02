@@ -1,0 +1,20 @@
+jaka-ds5-control - DualSense gamepad control for the JAKA arm
+
+Not implemented yet. This binary will read a DualSense gamepad and stream
+move and rotate commands to the jaka-cli serve protocol.
+
+Planned mapping:
+  Left stick     Move the head in the base XY plane
+  Right stick    Rotate the head
+  L2 / R2        Move down / up
+  Cross          Stop, release to the neutral position
+  Circle         Reset to the default pose
+  PS button      Power on
+  Touchpad       Power off
+
+Usage:
+  jaka-ds5-control [options]
+
+Options:
+  --ip <IP>       jaka-cli serve address, defaults to 127.0.0.1
+  --port <port>   jaka-cli serve port, defaults to 9000
