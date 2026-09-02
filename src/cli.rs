@@ -145,7 +145,7 @@ pub enum Command {
     #[command(disable_help_flag = true)]
     Serve {
         /// TCP port to listen on
-        #[arg(long, default_value_t = 9000)]
+        #[arg(long, default_value_t = 5533)]
         port: u16,
 
         /// Run without a controller, print the commands and reply with a

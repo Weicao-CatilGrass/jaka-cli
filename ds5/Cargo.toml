@@ -6,3 +6,4 @@ edition = "2024"
 # This package is a pure gamepad to TCP protocol layer, it never links the
 # JAKA SDK. It talks to the serve protocol of jaka-cli over TCP
 [dependencies]
+gilrs = "0.11.2"

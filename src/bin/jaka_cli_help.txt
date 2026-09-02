@@ -34,7 +34,7 @@ serve protocol:
   status                    Report estop, power, enable, joints and head position
 
 serve arguments:
-  --port <port>   TCP port to listen on, defaults to 9000
+  --port <port>   TCP port to listen on, defaults to 5533
   --mock          Run without a controller, print the commands and reply
                   with a simulated state for testing the client side
 
