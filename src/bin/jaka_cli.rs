@@ -1842,7 +1842,7 @@ fn joint_ok(j: &JointValue) -> bool {
     const LIMITS: [(f64, f64); 6] = [
         (-360.0, 360.0), // J1
         (-120.0, 120.0), // J2, JAKA Mini
-        (-360.0, 360.0), // J3
+        (-130.0, 130.0), // J3, JAKA Mini (not 360, verified in the URDF)
         (-360.0, 360.0), // J4
         (-120.0, 120.0), // J5, JAKA Mini
         (-360.0, 360.0), // J6
@@ -1887,25 +1887,19 @@ fn ik_solve(
     None
 }
 
-/// Compare two poses within the FK tolerance, positions in mm and angles in
-/// radians
+/// Compare two poses within the FK tolerance. Positions are compared in mm
+/// and orientations as the matrix rotation angle, because the rpy values of
+/// an equivalent orientation jump near the gimbal lock
 fn pose_close(a: &CartesianPose, b: &CartesianPose) -> bool {
     const POS_TOL: f64 = 1.0; // mm
-    const ORI_TOL: f64 = 5.0; // degrees
+    const ORI_TOL: f64 = 5.0_f64.to_radians(); // degrees
     let pos = ((a.tran.x - b.tran.x).powi(2)
         + (a.tran.y - b.tran.y).powi(2)
         + (a.tran.z - b.tran.z).powi(2))
     .sqrt();
-    pos < POS_TOL
-        && ang_diff(a.rpy.rx, b.rpy.rx).to_degrees().abs() < ORI_TOL
-        && ang_diff(a.rpy.ry, b.rpy.ry).to_degrees().abs() < ORI_TOL
-        && ang_diff(a.rpy.rz, b.rpy.rz).to_degrees().abs() < ORI_TOL
-}
-
-/// Angular difference wrapped into [-pi, pi]
-fn ang_diff(a: f64, b: f64) -> f64 {
-    let d = (a - b) % (2.0 * std::f64::consts::PI);
-    (d + std::f64::consts::PI).rem_euclid(2.0 * std::f64::consts::PI) - std::f64::consts::PI
+    let ra = rpy_to_rot(a.rpy.rx, a.rpy.ry, a.rpy.rz);
+    let rb = rpy_to_rot(b.rpy.rx, b.rpy.ry, b.rpy.rz);
+    pos < POS_TOL && rot_angle(ra, rb) < ORI_TOL
 }
 
 /// Build an IK reference by rotating the arm plane of the current joints
