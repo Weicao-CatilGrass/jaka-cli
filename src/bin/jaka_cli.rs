@@ -14,7 +14,7 @@ mod cli;
 use std::ffi::CString;
 use std::path::Path;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use binding::{
     BOOL, CartesianPose, CartesianTran, CoordType, DHParam, JKHD, JointValue, MoveMode,
@@ -199,10 +199,11 @@ fn print_plan(args: &Cli, command: &Command) {
 }
 
 async fn run(args: &Cli, command: &Command) -> Result<(), String> {
-    // The mock serve runs without a controller, only the protocol matters
+    // The mock serve runs without a controller, the simulated robot follows
+    // the same state machine and jog model as the real one
     if let Command::Serve { port, mock } = command {
         if *mock {
-            return serve(Backend::Mock(MockState::new()), *port, true).await;
+            return serve(Backend::Mock(MockState::new()), *port).await;
         }
     }
 
@@ -221,7 +222,7 @@ async fn run(args: &Cli, command: &Command) -> Result<(), String> {
 
     // Always disconnect, even when the operation below fails
     let result = match command {
-        Command::Serve { port, .. } => serve(Backend::Real(handle), *port, false).await,
+        Command::Serve { port, .. } => serve(Backend::Real(handle), *port).await,
         _ => drive(&handle, command, stdout_fd).await,
     };
     let ret = unsafe { binding::destory_handler(&handle) };
@@ -930,67 +931,202 @@ fn clamp_vel(v: [f64; 6]) -> [f64; 6] {
     out
 }
 
-/// Apply the new axis velocities with jog, stopping the axes that fell to
-/// zero. Translations are mm/s, rotations are deg/s in the protocol
-fn jog_axes(handle: &JKHD, last: &mut [f64; 6], v: [f64; 6]) -> Result<(), String> {
-    let v = clamp_vel(v);
-    for i in 0..6 {
-        if v[i] == 0.0 {
-            if last[i] != 0.0 {
-                check(&format!("Stop jog axis {i}"), unsafe {
-                    binding::jog_stop(handle, i as i32)
-                })?;
-            }
-        } else {
-            // The SDK takes rad/s for the rotational axes
-            let cmd = if i < 3 { v[i] } else { v[i].to_radians() };
-            check(&format!("Jog axis {i}"), unsafe {
-                binding::jog(
-                    handle,
-                    i as i32,
-                    MoveMode::Continue,
-                    CoordType::Base,
-                    cmd,
-                    0.0,
-                )
-            })?;
-        }
-    }
-    *last = v;
-    Ok(())
-}
-
-/// Stop every jog axis, used before point motions and on disconnect
-fn stop_jog(handle: &JKHD, last: &mut [f64; 6]) -> Result<(), String> {
-    for i in 0..6 {
-        if last[i] != 0.0 {
-            check(&format!("Stop jog axis {i}"), unsafe {
-                binding::jog_stop(handle, i as i32)
-            })?;
-        }
-    }
-    *last = [0.0; 6];
-    Ok(())
-}
-
 /// The backend behind the serve protocol: a real controller or a simulated
-/// state for testing the client side without the robot
+/// robot that follows the same state machine, so the mock behaves like the
+/// real thing. The protocol logic in exec_cmd is shared by both
 #[derive(Clone, Copy)]
 enum Backend {
     Real(JKHD),
     Mock(MockState),
 }
 
-/// Simulated robot state for serve --mock
+impl Backend {
+    fn is_mock(&self) -> bool {
+        matches!(self, Backend::Mock(_))
+    }
+
+    /// Whether the e-stop is active. The mock advances its simulation clock
+    /// first, so the report reflects the motion since the last command
+    fn in_estop(&mut self) -> Result<bool, String> {
+        match self {
+            Backend::Real(handle) => {
+                let mut st = RobotState::default();
+                check("Read state", unsafe {
+                    binding::get_robot_state(handle, &mut st)
+                })?;
+                Ok(st.estoped != 0)
+            }
+            Backend::Mock(state) => {
+                state.advance();
+                Ok(state.estop)
+            }
+        }
+    }
+
+    /// Run one axis at a continuous velocity, translations in mm/s and
+    /// rotations in deg/s in the protocol
+    fn jog_axis(&mut self, axis: usize, vel: f64) -> Result<(), String> {
+        match self {
+            Backend::Real(handle) => {
+                // The SDK takes rad/s for the rotational axes
+                let cmd = if axis < 3 { vel } else { vel.to_radians() };
+                check(&format!("Jog axis {axis}"), unsafe {
+                    binding::jog(
+                        handle,
+                        axis as i32,
+                        MoveMode::Continue,
+                        CoordType::Base,
+                        cmd,
+                        0.0,
+                    )
+                })
+            }
+            Backend::Mock(state) => state.set_jog(axis, vel),
+        }
+    }
+
+    /// Stop one jog axis
+    fn stop_axis(&mut self, axis: usize) -> Result<(), String> {
+        match self {
+            Backend::Real(handle) => check(&format!("Stop jog axis {axis}"), unsafe {
+                binding::jog_stop(handle, axis as i32)
+            }),
+            Backend::Mock(state) => {
+                state.stop_jog(axis);
+                Ok(())
+            }
+        }
+    }
+
+    /// Abort every ongoing motion
+    fn abort_motion(&mut self) -> Result<(), String> {
+        match self {
+            Backend::Real(handle) => {
+                check("Abort motion", unsafe { binding::motion_abort(handle) })
+            }
+            Backend::Mock(state) => {
+                state.stop_all();
+                Ok(())
+            }
+        }
+    }
+
+    /// Clear the e-stop error state
+    fn clear_error(&mut self) -> Result<(), String> {
+        match self {
+            Backend::Real(handle) => estop_clear(handle),
+            Backend::Mock(state) => {
+                state.estop = false;
+                Ok(())
+            }
+        }
+    }
+
+    /// Power on and enable the robot, rejected while the e-stop is active
+    fn power_on(&mut self) -> Result<(), String> {
+        match self {
+            Backend::Real(handle) => {
+                let mut st = RobotState::default();
+                check("Read state", unsafe {
+                    binding::get_robot_state(handle, &mut st)
+                })?;
+                ensure_powered_enabled(handle, &st)
+            }
+            Backend::Mock(state) => state.power_on(),
+        }
+    }
+
+    /// Disable the servos and power off
+    fn power_off(&mut self) -> Result<(), String> {
+        match self {
+            Backend::Real(handle) => {
+                let mut st = RobotState::default();
+                check("Read state", unsafe {
+                    binding::get_robot_state(handle, &mut st)
+                })?;
+                if st.servo_enabled != 0 {
+                    check("Disable servos", unsafe { binding::disable_robot(handle) })?;
+                }
+                if st.powered_on != 0 {
+                    check("Power off", unsafe { binding::power_off(handle) })?;
+                }
+                Ok(())
+            }
+            Backend::Mock(state) => {
+                state.power_off();
+                Ok(())
+            }
+        }
+    }
+
+    /// Restore the built-in home pose. The real robot moves there, the mock
+    /// teleports because no point motion is simulated
+    async fn restore_home(&mut self) -> Result<(), String> {
+        match self {
+            Backend::Real(handle) => restore(handle, None, 3.14).await,
+            Backend::Mock(state) => {
+                state.restore_home();
+                Ok(())
+            }
+        }
+    }
+
+    /// Report the state as the protocol status JSON
+    fn status_json(&mut self) -> Result<String, String> {
+        match self {
+            Backend::Real(handle) => {
+                let mut st = RobotState::default();
+                check("Read state", unsafe {
+                    binding::get_robot_state(handle, &mut st)
+                })?;
+                let mut joints = JointValue::zero();
+                check("Read joint position", unsafe {
+                    binding::get_joint_position(handle, &mut joints)
+                })?;
+                let mut tcp = CartesianPose::zero();
+                check("Read TCP position", unsafe {
+                    binding::get_tcp_position(handle, &mut tcp)
+                })?;
+                let j: Vec<f64> = joints.j_val.iter().map(|v| v.to_degrees()).collect();
+                let json = serde_json::json!({
+                    "estop": st.estoped != 0,
+                    "powered": st.powered_on != 0,
+                    "enabled": st.servo_enabled != 0,
+                    "joints": j,
+                    "head_pos": [tcp.tran.x, tcp.tran.y, tcp.tran.z],
+                });
+                Ok(format!("status {json}\n"))
+            }
+            Backend::Mock(state) => Ok(state.status_json()),
+        }
+    }
+}
+
+/// The TCP pose and joint angles in degrees the mock starts and resets to
+const HOME_HEAD: [f64; 6] = [-50.1, -6.0, 396.8, 0.0, 90.0, 0.0];
+const HOME_JOINTS: [f64; 6] = [0.0, 90.0, -90.0, 0.0, -90.0, 0.0];
+
+/// The longest time a paused simulation may integrate in one step. A real
+/// jog runs until stopped, but a mock left running for minutes must not
+/// shoot across the whole workspace on the next command
+const MAX_STEP: f64 = 0.5;
+
+/// Simulated robot with the same state machine as the controller. The mock
+/// jogs on wall-clock time like the real arm, so a status after a pause
+/// reflects the motion that happened in between
 #[derive(Clone, Copy)]
 struct MockState {
     powered: bool,
     enabled: bool,
     estop: bool,
-    /// TCP x y z in mm and rx ry rz in degrees, the home pose at startup
+    /// TCP x y z in mm and rx ry rz in degrees
     head: [f64; 6],
-    /// Joint angles in degrees, the default pose at startup
+    /// Joint angles in degrees, static because the mock only simulates the TCP
     joints: [f64; 6],
+    /// The jog velocity of each axis in protocol units, mm/s and deg/s
+    jog: [f64; 6],
+    /// When the jog velocities were applied last
+    last: Instant,
 }
 
 impl MockState {
@@ -999,13 +1135,78 @@ impl MockState {
             powered: false,
             enabled: false,
             estop: false,
-            head: [-50.1, -6.0, 396.8, 0.0, 90.0, 0.0],
-            joints: [0.0, 90.0, -90.0, 0.0, -90.0, 0.0],
+            head: HOME_HEAD,
+            joints: HOME_JOINTS,
+            jog: [0.0; 6],
+            last: Instant::now(),
         }
     }
 
-    fn reset(&mut self) {
-        *self = Self::new();
+    /// Integrate the jog velocities over the time since the last advance
+    fn advance(&mut self) {
+        let dt = self.last.elapsed().as_secs_f64().min(MAX_STEP);
+        self.last = Instant::now();
+        self.integrate(dt);
+    }
+
+    /// Run the simulation forward by an explicit delta, used by the tests
+    #[cfg(test)]
+    fn tick(&mut self, dt: f64) {
+        self.last = Instant::now();
+        self.integrate(dt);
+    }
+
+    fn integrate(&mut self, dt: f64) {
+        for i in 0..6 {
+            self.head[i] += self.jog[i] * dt;
+        }
+    }
+
+    /// Start one axis at a velocity, rejected while the arm cannot move
+    fn set_jog(&mut self, axis: usize, vel: f64) -> Result<(), String> {
+        self.advance();
+        if self.estop {
+            return Err("E-stop is active, clear it first".into());
+        }
+        if !self.enabled {
+            return Err("Servos are not enabled, power on first".into());
+        }
+        self.jog[axis] = vel;
+        Ok(())
+    }
+
+    fn stop_jog(&mut self, axis: usize) {
+        self.advance();
+        self.jog[axis] = 0.0;
+    }
+
+    fn stop_all(&mut self) {
+        self.advance();
+        self.jog = [0.0; 6];
+    }
+
+    fn power_on(&mut self) -> Result<(), String> {
+        self.advance();
+        if self.estop {
+            return Err("E-stop is pressed, release the button first".into());
+        }
+        self.powered = true;
+        self.enabled = true;
+        Ok(())
+    }
+
+    fn power_off(&mut self) {
+        self.advance();
+        self.enabled = false;
+        self.powered = false;
+        self.jog = [0.0; 6];
+    }
+
+    fn restore_home(&mut self) {
+        self.advance();
+        self.head = HOME_HEAD;
+        self.joints = HOME_JOINTS;
+        self.jog = [0.0; 6];
     }
 
     fn status_json(&self) -> String {
@@ -1020,41 +1221,15 @@ impl MockState {
     }
 }
 
-/// Run one protocol command against the simulated state, no robot involved
-fn exec_mock(state: &mut MockState, cmd: ProtoCmd) -> Result<String, String> {
-    match cmd {
-        ProtoCmd::Vel(dx, dy, dz, drx, dry, drz) => {
-            // Simulate a 50 ms control frame
-            state.head[0] += dx * 0.05;
-            state.head[1] += dy * 0.05;
-            state.head[2] += dz * 0.05;
-            state.head[3] += drx * 0.05;
-            state.head[4] += dry * 0.05;
-            state.head[5] += drz * 0.05;
-            Ok("ok\n".into())
+/// Stop every jog axis that is still running and reset the velocity memory
+fn stop_last(backend: &mut Backend, last: &mut [f64; 6]) -> Result<(), String> {
+    for i in 0..6 {
+        if last[i] != 0.0 {
+            backend.stop_axis(i)?;
         }
-        ProtoCmd::EstopClear => {
-            state.estop = false;
-            Ok("ok\n".into())
-        }
-        ProtoCmd::PowerOn => {
-            state.powered = true;
-            state.enabled = true;
-            Ok("ok\n".into())
-        }
-        ProtoCmd::PowerOff => {
-            state.enabled = false;
-            state.powered = false;
-            Ok("ok\n".into())
-        }
-        ProtoCmd::Reset => {
-            state.reset();
-            state.powered = true;
-            state.enabled = true;
-            Ok("ok\n".into())
-        }
-        ProtoCmd::Status => Ok(state.status_json()),
     }
+    *last = [0.0; 6];
+    Ok(())
 }
 
 /// Parse one protocol line: the command name followed by space separated numbers
@@ -1095,11 +1270,11 @@ fn parse_proto(line: &str) -> Result<ProtoCmd, String> {
 /// Serve the gamepad control protocol over TCP. Incremental motion commands
 /// abort the previous motion and start a new one, so the gamepad can stream
 /// commands at its own frame rate
-async fn serve(backend: Backend, port: u16, mock: bool) -> Result<(), String> {
+async fn serve(mut backend: Backend, port: u16) -> Result<(), String> {
     let listener = TcpListener::bind(("0.0.0.0", port))
         .await
         .map_err(|e| format!("Bind port {port} failed: {e}"))?;
-    if mock {
+    if backend.is_mock() {
         info!("Mock control server listening on port {port}, no controller involved");
     } else {
         info!("Control server listening on port {port}");
@@ -1110,10 +1285,8 @@ async fn serve(backend: Backend, port: u16, mock: bool) -> Result<(), String> {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 info!("Ctrl+C received, stopping all motions and disconnecting clients");
-                // Stop every ongoing motion first, the SDK abort is global
-                if let Backend::Real(handle) = backend {
-                    let _ = unsafe { binding::motion_abort(&handle) };
-                }
+                // Stop the ongoing motions first, the SDK abort is global
+                let _ = backend.abort_motion();
                 // Aborting the tasks drops the streams and closes the
                 // client connections
                 for c in &clients {
@@ -1134,9 +1307,8 @@ async fn serve(backend: Backend, port: u16, mock: bool) -> Result<(), String> {
                 };
                 info!("Control client connected from {addr}");
                 let mut backend = backend.clone();
-                let mock = mock;
                 clients.push(tokio::spawn(async move {
-                    if let Err(e) = handle_client(&mut backend, stream, mock).await {
+                    if let Err(e) = handle_client(&mut backend, stream).await {
                         warn!("Control client {addr} error: {e}");
                     }
                 }));
@@ -1148,7 +1320,7 @@ async fn serve(backend: Backend, port: u16, mock: bool) -> Result<(), String> {
 }
 
 /// Serve one control client: read protocol lines, reply to each command
-async fn handle_client(backend: &mut Backend, stream: TcpStream, mock: bool) -> Result<(), String> {
+async fn handle_client(backend: &mut Backend, stream: TcpStream) -> Result<(), String> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = tokio::io::BufReader::new(reader).lines();
     // The jog velocity of each axis, used to stop the axes that fell to zero
@@ -1163,7 +1335,7 @@ async fn handle_client(backend: &mut Backend, stream: TcpStream, mock: bool) -> 
         if line.is_empty() {
             continue;
         }
-        if mock {
+        if backend.is_mock() {
             info!("[mock] {line}");
         }
         let reply = handle_proto(backend, &mut last_vel, line).await;
@@ -1173,9 +1345,7 @@ async fn handle_client(backend: &mut Backend, stream: TcpStream, mock: bool) -> 
             .map_err(|e| format!("Write reply failed: {e}"))?;
     }
     // Disconnecting stops every jog axis for safety
-    if let Backend::Real(handle) = backend {
-        let _ = stop_jog(handle, &mut last_vel);
-    }
+    stop_last(backend, &mut last_vel)?;
     info!("Control client disconnected");
     Ok(())
 }
@@ -1186,102 +1356,64 @@ async fn handle_proto(backend: &mut Backend, last_vel: &mut [f64; 6], line: &str
         Ok(c) => c,
         Err(e) => return format!("err {e}\n"),
     };
-    match exec_proto(backend, last_vel, cmd).await {
+    match exec_cmd(backend, last_vel, cmd).await {
         Ok(reply) => reply,
         Err(e) => format!("err {e}\n"),
     }
 }
 
-/// Run one parsed protocol command against the backend
-async fn exec_proto(
+/// Run one parsed protocol command against either backend. The velocity
+/// handling is shared: clamp the command, then start, update or stop each
+/// axis. An axis that keeps the same velocity is left running, restarting
+/// it on every frame makes the motion stutter
+async fn exec_cmd(
     backend: &mut Backend,
-    last_vel: &mut [f64; 6],
-    cmd: ProtoCmd,
-) -> Result<String, String> {
-    match backend {
-        Backend::Real(handle) => exec_real(handle, last_vel, cmd).await,
-        Backend::Mock(state) => exec_mock(state, cmd),
-    }
-}
-
-/// Run one parsed protocol command against the real controller
-async fn exec_real(
-    handle: &JKHD,
     last_vel: &mut [f64; 6],
     cmd: ProtoCmd,
 ) -> Result<String, String> {
     match cmd {
         ProtoCmd::Vel(dx, dy, dz, drx, dry, drz) => {
-            jog_axes(handle, last_vel, [dx, dy, dz, drx, dry, drz])?;
+            let v = clamp_vel([dx, dy, dz, drx, dry, drz]);
+            for i in 0..6 {
+                if v[i] == 0.0 {
+                    if last_vel[i] != 0.0 {
+                        backend.stop_axis(i)?;
+                    }
+                } else if v[i] != last_vel[i] {
+                    backend.jog_axis(i, v[i])?;
+                }
+            }
+            *last_vel = v;
             Ok("ok\n".into())
         }
         ProtoCmd::EstopClear => {
-            stop_jog(handle, last_vel)?;
-            estop_clear(handle)?;
+            stop_last(backend, last_vel)?;
+            backend.clear_error()?;
             Ok("ok\n".into())
         }
         ProtoCmd::PowerOn => {
-            stop_jog(handle, last_vel)?;
-            let mut st = RobotState::default();
-            check("Read state", unsafe {
-                binding::get_robot_state(handle, &mut st)
-            })?;
-            if st.estoped != 0 {
+            stop_last(backend, last_vel)?;
+            if backend.in_estop()? {
                 return Err("E-stop is pressed, release the button first".into());
             }
-            ensure_powered_enabled(handle, &st)?;
+            backend.power_on()?;
             Ok("ok\n".into())
         }
         ProtoCmd::PowerOff => {
-            stop_jog(handle, last_vel)?;
-            let mut st = RobotState::default();
-            check("Read state", unsafe {
-                binding::get_robot_state(handle, &mut st)
-            })?;
-            if st.servo_enabled != 0 {
-                check("Disable servos", unsafe { binding::disable_robot(handle) })?;
-            }
-            if st.powered_on != 0 {
-                check("Power off", unsafe { binding::power_off(handle) })?;
-            }
+            stop_last(backend, last_vel)?;
+            backend.power_off()?;
             Ok("ok\n".into())
         }
         ProtoCmd::Reset => {
-            stop_jog(handle, last_vel)?;
-            let mut st = RobotState::default();
-            check("Read state", unsafe {
-                binding::get_robot_state(handle, &mut st)
-            })?;
-            if st.estoped != 0 {
+            stop_last(backend, last_vel)?;
+            if backend.in_estop()? {
                 return Err("E-stop is pressed, release the button first".into());
             }
-            ensure_powered_enabled(handle, &st)?;
-            restore(handle, None, 3.14).await?;
+            backend.power_on()?;
+            backend.restore_home().await?;
             Ok("ok\n".into())
         }
-        ProtoCmd::Status => {
-            let mut st = RobotState::default();
-            check("Read state", unsafe {
-                binding::get_robot_state(handle, &mut st)
-            })?;
-            let mut joints = JointValue::zero();
-            check("Read joint position", unsafe {
-                binding::get_joint_position(handle, &mut joints)
-            })?;
-            let mut tcp = CartesianPose::zero();
-            check("Read TCP position", unsafe {
-                binding::get_tcp_position(handle, &mut tcp)
-            })?;
-            let j: Vec<f64> = joints.j_val.iter().map(|v| v.to_degrees()).collect();
-            let json = serde_json::json!({
-                "estop": st.estoped != 0,
-                "powered": st.powered_on != 0,
-                "enabled": st.servo_enabled != 0,
-                "joints": j,
-                "head_pos": [tcp.tran.x, tcp.tran.y, tcp.tran.z],
-            });
-            Ok(format!("status {json}\n"))
-        }
+        ProtoCmd::Status => backend.status_json(),
     }
 }
 
@@ -1523,9 +1655,10 @@ fn fmt_array(vals: &[f64; 6]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::Backend;
     use super::MockState;
     use super::ProtoCmd;
-    use super::exec_mock;
+    use super::exec_cmd;
     use super::parse_proto;
 
     #[test]
@@ -1562,19 +1695,152 @@ mod tests {
         assert!(parse_proto("move 1 2 3").is_err());
     }
 
-    #[test]
-    fn mock_state_moves_and_reports() {
-        let mut st = MockState::new();
-        assert!(exec_mock(&mut st, ProtoCmd::PowerOn).is_ok());
+    #[tokio::test]
+    async fn mock_vel_requires_power_and_clamps() {
+        let mut backend = Backend::Mock(MockState::new());
+        let mut last = [0.0; 6];
+        // The real arm rejects jog before power on, the mock does the same
+        let vel = ProtoCmd::Vel(10.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        assert!(exec_cmd(&mut backend, &mut last, vel).await.is_err());
+        assert!(
+            exec_cmd(&mut backend, &mut last, ProtoCmd::PowerOn)
+                .await
+                .is_ok()
+        );
+        assert!(
+            exec_cmd(
+                &mut backend,
+                &mut last,
+                ProtoCmd::Vel(10.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+            )
+            .await
+            .is_ok()
+        );
+        // Velocities above the safe limits get clamped, here 1000 to 100 mm/s
+        assert!(
+            exec_cmd(
+                &mut backend,
+                &mut last,
+                ProtoCmd::Vel(1000.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+            )
+            .await
+            .is_ok()
+        );
+        // A zero velocity stops the axis
+        assert!(
+            exec_cmd(
+                &mut backend,
+                &mut last,
+                ProtoCmd::Vel(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+            )
+            .await
+            .is_ok()
+        );
+        let st = match &backend {
+            Backend::Mock(st) => st,
+            Backend::Real(_) => unreachable!(),
+        };
+        assert_eq!(st.jog[0], 0.0);
+    }
+
+    #[tokio::test]
+    async fn mock_estop_blocks_motion_until_cleared() {
+        let mut backend = Backend::Mock(MockState::new());
+        let mut last = [0.0; 6];
+        assert!(
+            exec_cmd(&mut backend, &mut last, ProtoCmd::PowerOn)
+                .await
+                .is_ok()
+        );
+        // Press the e-stop the way the physical button would
+        match &mut backend {
+            Backend::Mock(st) => st.estop = true,
+            Backend::Real(_) => unreachable!(),
+        }
+        assert!(
+            exec_cmd(
+                &mut backend,
+                &mut last,
+                ProtoCmd::Vel(10.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            exec_cmd(&mut backend, &mut last, ProtoCmd::PowerOn)
+                .await
+                .is_err()
+        );
+        assert!(
+            exec_cmd(&mut backend, &mut last, ProtoCmd::EstopClear)
+                .await
+                .is_ok()
+        );
+        assert!(
+            exec_cmd(&mut backend, &mut last, ProtoCmd::PowerOn)
+                .await
+                .is_ok()
+        );
+        assert!(
+            exec_cmd(
+                &mut backend,
+                &mut last,
+                ProtoCmd::Vel(10.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+            )
+            .await
+            .is_ok()
+        );
+        let st = match &backend {
+            Backend::Mock(st) => st,
+            Backend::Real(_) => unreachable!(),
+        };
+        assert!(st.powered && st.enabled && !st.estop);
+        assert_eq!(st.jog[0], 10.0);
+    }
+
+    #[tokio::test]
+    async fn mock_reset_returns_home_and_stays_on() {
+        let mut backend = Backend::Mock(MockState::new());
+        let mut last = [0.0; 6];
+        assert!(
+            exec_cmd(&mut backend, &mut last, ProtoCmd::PowerOn)
+                .await
+                .is_ok()
+        );
+        assert!(
+            exec_cmd(
+                &mut backend,
+                &mut last,
+                ProtoCmd::Vel(10.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+            )
+            .await
+            .is_ok()
+        );
+        assert!(
+            exec_cmd(&mut backend, &mut last, ProtoCmd::Reset)
+                .await
+                .is_ok()
+        );
+        let st = match &backend {
+            Backend::Mock(st) => st,
+            Backend::Real(_) => unreachable!(),
+        };
         assert!(st.powered && st.enabled);
-        assert!(exec_mock(&mut st, ProtoCmd::Vel(10.0, -5.0, 0.0, 0.0, 0.0, 0.0)).is_ok());
-        assert_eq!(st.head[0], -50.1 + 0.5);
-        assert_eq!(st.head[1], -6.0 - 0.25);
-        assert!(exec_mock(&mut st, ProtoCmd::Vel(0.0, 0.0, 0.0, 0.0, 0.0, 15.0)).is_ok());
-        assert_eq!(st.head[5], 0.75);
-        let reply = exec_mock(&mut st, ProtoCmd::Status).unwrap();
-        assert!(reply.contains("\"powered\":true"));
-        assert!(exec_mock(&mut st, ProtoCmd::Reset).is_ok());
-        assert_eq!(st.head[0], -50.1);
+        assert_eq!(st.head, super::HOME_HEAD);
+        assert_eq!(st.jog, [0.0; 6]);
+    }
+
+    #[test]
+    fn mock_jogs_on_wall_clock() {
+        let mut st = MockState::new();
+        st.power_on().unwrap();
+        st.set_jog(0, 100.0).unwrap();
+        st.tick(0.5);
+        // The wall clock may add microseconds of motion on top of the tick
+        assert!((st.head[0] - (-0.1)).abs() < 1e-6);
+        st.stop_jog(0);
+        let before = st.head[0];
+        st.tick(1.0);
+        assert_eq!(st.head[0], before);
     }
 }

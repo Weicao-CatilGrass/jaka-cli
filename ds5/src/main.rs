@@ -18,6 +18,13 @@ const ROTATE_SCALE: f32 = 20.0;
 /// Shoulder button velocity in mm/s while held
 const Z_SCALE: f32 = 40.0;
 
+/// Quantize a velocity to whole units and snap tiny values to zero, so a
+/// resting stick sends a stable command instead of jittering
+fn quant(v: f32) -> f32 {
+    let q = v.round();
+    if q.abs() < 1.0 { 0.0 } else { q }
+}
+
 /// The input snapshot of one control frame
 #[derive(Default)]
 struct Input {
@@ -64,6 +71,8 @@ fn main() {
     println!("gamepad: {}", gilrs.gamepad(gp_id).name());
 
     let mut prev = Input::default();
+    // The velocity of the last sent vel command, NaN forces the first frame
+    let mut prev_vel = [f32::NAN; 6];
     loop {
         // Process the pending events. The gamepad mapping is only applied
         // and the cached state only updated inside next_event, without it
@@ -75,15 +84,14 @@ fn main() {
         }
         let inp = read_input(&gp);
 
-        // Velocity commands stream every frame, axes at zero stop. The
-        // right stick tilts the head around X and turns it around Z
+        // The right stick tilts the head around X and turns it around Z
         let dx = if inp.stick_x.abs() > DEADZONE {
-            inp.stick_x * MOVE_SCALE
+            quant(inp.stick_x * MOVE_SCALE)
         } else {
             0.0
         };
         let dy = if inp.stick_y.abs() > DEADZONE {
-            inp.stick_y * MOVE_SCALE
+            quant(inp.stick_y * MOVE_SCALE)
         } else {
             0.0
         };
@@ -96,20 +104,29 @@ fn main() {
             0.0
         };
         let drx = if inp.rot_y.abs() > DEADZONE {
-            inp.rot_y * ROTATE_SCALE
+            quant(inp.rot_y * ROTATE_SCALE)
         } else {
             0.0
         };
         let drz = if inp.rot_x.abs() > DEADZONE {
-            inp.rot_x * ROTATE_SCALE
+            quant(inp.rot_x * ROTATE_SCALE)
         } else {
             0.0
         };
-        send(
-            &mut stream,
-            &mut reader,
-            &format!("vel {dx:.1} {dy:.1} {dz:.1} {drx:.1} 0 {drz:.1}"),
-        );
+        let vel = [dx, dy, dz, drx, 0.0, drz];
+        // Send only the changes: a jog axis keeps its velocity until the
+        // next command, so a steady stick must not resend the same value
+        if vel != prev_vel {
+            send(
+                &mut stream,
+                &mut reader,
+                &format!(
+                    "vel {:.0} {:.0} {:.0} {:.0} {:.0} {:.0}",
+                    vel[0], vel[1], vel[2], vel[3], vel[4], vel[5]
+                ),
+            );
+            prev_vel = vel;
+        }
         // Buttons fire once on the press edge
         if inp.cross && !prev.cross {
             send(&mut stream, &mut reader, "estop-clear");
@@ -124,7 +141,8 @@ fn main() {
             send(&mut stream, &mut reader, "poweroff");
         }
         prev = inp;
-        std::thread::sleep(Duration::from_millis(50));
+        // Scan at 100 Hz, only changed velocities produce a command
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
