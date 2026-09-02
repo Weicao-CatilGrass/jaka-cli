@@ -6,10 +6,10 @@ the JAKA SDK.
 
 Controls:
   Left stick     Move the head in the base XY plane
-  Right stick    Rotate the head, up down tilts, left right turns
-  L2 / R2        Move down / up
-  Cross          Stop, abort the ongoing motion
-  Circle         Reset to the default pose
+  L1 / R1        Move down / up
+  Right stick    Tilt the head (up down) and turn it (left right)
+  Cross          Clear the e-stop
+  Triangle       Reset to the default pose
   PS button      Power on
   Select         Power off
 

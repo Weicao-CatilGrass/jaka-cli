@@ -15,8 +15,8 @@ const DEADZONE: f32 = 0.15;
 const MOVE_SCALE: f32 = 4.0;
 /// Stick deflection to degrees per frame
 const ROTATE_SCALE: f32 = 3.0;
-/// Trigger travel to millimeters per frame
-const TRIGGER_SCALE: f32 = 4.0;
+/// Fixed millimeters per frame while a shoulder button is held
+const Z_SCALE: f32 = 4.0;
 
 /// The input snapshot of one control frame
 #[derive(Default)]
@@ -25,9 +25,10 @@ struct Input {
     stick_y: f32,
     rot_x: f32,
     rot_y: f32,
-    trigger: f32,
+    shoulder_l: bool,
+    shoulder_r: bool,
     cross: bool,
-    circle: bool,
+    triangle: bool,
     ps: bool,
     select: bool,
 }
@@ -38,10 +39,10 @@ fn read_input(gp: &Gamepad) -> Input {
         stick_y: gp.value(Axis::LeftStickY),
         rot_x: gp.value(Axis::RightStickX),
         rot_y: gp.value(Axis::RightStickY),
-        // LeftZ lowers, RightZ raises
-        trigger: gp.value(Axis::RightZ) - gp.value(Axis::LeftZ),
+        shoulder_l: gp.is_pressed(Button::LeftTrigger),
+        shoulder_r: gp.is_pressed(Button::RightTrigger),
         cross: gp.is_pressed(Button::South),
-        circle: gp.is_pressed(Button::East),
+        triangle: gp.is_pressed(Button::North),
         ps: gp.is_pressed(Button::Mode),
         select: gp.is_pressed(Button::Select),
     }
@@ -74,8 +75,10 @@ fn main() {
         }
         let inp = read_input(&gp);
 
-        // Motion commands stream every frame while a stick or trigger is
-        // deflected, releasing it stops the stream and the robot holds
+        // Motion commands stream every frame while a stick or button is
+        // held, releasing it stops the stream and the robot holds. The XY
+        // stick and the shoulder Z merge into one move so they do not
+        // abort each other
         let dx = if inp.stick_x.abs() > DEADZONE {
             inp.stick_x * MOVE_SCALE
         } else {
@@ -86,39 +89,44 @@ fn main() {
         } else {
             0.0
         };
-        if dx != 0.0 || dy != 0.0 {
-            send(&mut stream, &mut reader, &format!("move {dx:.1} {dy:.1} 0"));
+        // L1 lowers, R1 raises
+        let dz = if inp.shoulder_l {
+            -Z_SCALE
+        } else if inp.shoulder_r {
+            Z_SCALE
+        } else {
+            0.0
+        };
+        if dx != 0.0 || dy != 0.0 || dz != 0.0 {
+            send(
+                &mut stream,
+                &mut reader,
+                &format!("move {dx:.1} {dy:.1} {dz:.1}"),
+            );
         }
+        // The right stick tilts the head around X and turns it around Z
+        let drx = if inp.rot_y.abs() > DEADZONE {
+            inp.rot_y * ROTATE_SCALE
+        } else {
+            0.0
+        };
         let drz = if inp.rot_x.abs() > DEADZONE {
             inp.rot_x * ROTATE_SCALE
         } else {
             0.0
         };
-        let dry = if inp.rot_y.abs() > DEADZONE {
-            inp.rot_y * ROTATE_SCALE
-        } else {
-            0.0
-        };
-        if drz != 0.0 || dry != 0.0 {
+        if drx != 0.0 || drz != 0.0 {
             send(
                 &mut stream,
                 &mut reader,
-                &format!("rotate 0 {dry:.1} {drz:.1}"),
+                &format!("rotate {drx:.1} 0 {drz:.1}"),
             );
         }
-        if inp.trigger.abs() > 0.1 {
-            send(
-                &mut stream,
-                &mut reader,
-                &format!("move 0 0 {:.1}", inp.trigger * TRIGGER_SCALE),
-            );
-        }
-
         // Buttons fire once on the press edge
         if inp.cross && !prev.cross {
-            send(&mut stream, &mut reader, "stop");
+            send(&mut stream, &mut reader, "estop-clear");
         }
-        if inp.circle && !prev.circle {
+        if inp.triangle && !prev.triangle {
             send(&mut stream, &mut reader, "reset");
         }
         if inp.ps && !prev.ps {
