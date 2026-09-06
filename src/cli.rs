@@ -4,7 +4,21 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+
+/// The IO bank to address, the end tool or the control cabinet
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum IoWhere {
+    Tool,
+    Cabinet,
+}
+
+/// A digital state word, accepts on/off
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum OnOff {
+    On,
+    Off,
+}
 
 /// JAKA robotic arm driver
 #[derive(Parser, Debug)]
@@ -156,5 +170,47 @@ pub enum Command {
         /// simulated state for testing the client side
         #[arg(long)]
         mock: bool,
+    },
+
+    /// Print every tool and cabinet digital input and output plus the tool
+    /// IO supply voltage as JSON to stdout
+    #[command(disable_help_flag = true)]
+    IoState,
+
+    /// Read one digital input of the tool or the cabinet
+    #[command(disable_help_flag = true)]
+    Di {
+        /// The IO bank: tool or cabinet
+        #[arg(value_enum, value_name = "TOOL|CABINET")]
+        io_where: IoWhere,
+
+        /// Input index, from 0
+        #[arg(value_name = "INDEX")]
+        index: i32,
+    },
+
+    /// Set one digital output of the tool or the cabinet and read it back
+    #[command(disable_help_flag = true)]
+    Do {
+        /// The IO bank: tool or cabinet
+        #[arg(value_enum, value_name = "TOOL|CABINET")]
+        io_where: IoWhere,
+
+        /// Output index, from 0
+        #[arg(value_name = "INDEX")]
+        index: i32,
+
+        /// The new state: on or off
+        #[arg(value_enum, value_name = "ON|OFF")]
+        state: OnOff,
+    },
+
+    /// Show the tool IO supply voltage, or set it when a mode is given:
+    /// 24 for 24 V, 12 for 12 V, off to disable the supply
+    #[command(disable_help_flag = true)]
+    TioVout {
+        /// The supply mode: 24, 12 or off, query when omitted
+        #[arg(value_name = "24|12|OFF", value_parser = ["24", "12", "off"])]
+        mode: Option<String>,
     },
 }

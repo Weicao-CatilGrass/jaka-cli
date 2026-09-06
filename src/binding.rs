@@ -128,6 +128,20 @@ pub enum CoordType {
     Tool = 2,
 }
 
+/// IO bank (jktypes.h: IOType)
+#[repr(i32)]
+#[allow(dead_code)] // Extend/Relay/slaves are not used yet but kept to mirror the header
+#[derive(Clone, Copy, Debug)]
+pub enum IOType {
+    Cabinet = 0,
+    Tool = 1,
+    Extend = 2,
+    Relay = 3,
+    ModbusSlave = 4,
+    ProfinetSlave = 5,
+    EipSlave = 6,
+}
+
 /// Optional motion parameters, always null in this project (jktypes.h: OptionalCond)
 #[repr(C)]
 pub struct OptionalCond {
@@ -155,6 +169,40 @@ unsafe extern "C" {
     /// Read the controller error state and message
     #[link_name = "jk_safe_get_robot_status_simple"]
     pub fn get_robot_status_simple(handle: *const JKHD, status: *mut RobotStatusSimple) -> errno_t;
+    /// Set one digital output of an IO bank
+    #[link_name = "jk_safe_set_digital_output"]
+    pub fn set_digital_output(
+        handle: *const JKHD,
+        io_type: IOType,
+        index: i32,
+        value: BOOL,
+    ) -> errno_t;
+    /// Read one digital output of an IO bank
+    #[link_name = "jk_safe_get_digital_output"]
+    pub fn get_digital_output(
+        handle: *const JKHD,
+        io_type: IOType,
+        index: i32,
+        value: *mut BOOL,
+    ) -> errno_t;
+    /// Read one digital input of an IO bank
+    #[link_name = "jk_safe_get_digital_input"]
+    pub fn get_digital_input(
+        handle: *const JKHD,
+        io_type: IOType,
+        index: i32,
+        value: *mut BOOL,
+    ) -> errno_t;
+    /// Set the tool IO supply: enable 0/1 and voltage 0 = 24 V, 1 = 12 V
+    #[link_name = "jk_safe_set_tio_vout_param"]
+    pub fn set_tio_vout_param(handle: *const JKHD, vout_enable: i32, vout_vol: i32) -> errno_t;
+    /// Read the tool IO supply configuration
+    #[link_name = "jk_safe_get_tio_vout_param"]
+    pub fn get_tio_vout_param(
+        handle: *const JKHD,
+        vout_enable: *mut i32,
+        vout_vol: *mut i32,
+    ) -> errno_t;
     #[link_name = "jk_safe_get_dh_param"]
     pub fn get_dh_param(handle: *const JKHD, dh_param: *mut DHParam) -> errno_t;
     #[link_name = "jk_safe_get_joint_position"]

@@ -22,7 +22,7 @@ use binding::{
     RobotState, Rpy, check, errno_t,
 };
 use clap::Parser;
-use cli::{Cli, Command};
+use cli::{Cli, Command, IoWhere, OnOff};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
@@ -70,7 +70,7 @@ async fn main() -> ExitCode {
 
     let Some(command) = &args.command else {
         error!(
-            "No subcommand given. Expected one of status, power-on, power-off, estop-clear, inspect, inspect-pos, dh, set-base, rot, restore, move-to, serve. Use --help for usage"
+            "No subcommand given. Expected one of status, power-on, power-off, estop-clear, inspect, inspect-pos, dh, set-base, rot, restore, move-to, serve, io-state, di, do, tio-vout. Use --help for usage"
         );
         return ExitCode::FAILURE;
     };
@@ -119,6 +119,35 @@ fn print_plan(args: &Cli, command: &Command) {
             "[dry-run] Will connect to controller {} and print the DH parameters as JSON",
             args.ip
         ),
+        Command::IoState => info!(
+            "[dry-run] Will connect to controller {} and query every tool and cabinet digital IO",
+            args.ip
+        ),
+        Command::Di { io_where, index } => info!(
+            "[dry-run] Will connect to controller {} and read the {} DI{index}",
+            args.ip,
+            io_name(*io_where)
+        ),
+        Command::Do {
+            io_where,
+            index,
+            state,
+        } => info!(
+            "[dry-run] Will connect to controller {} and set the {} DO{index} to {}",
+            args.ip,
+            io_name(*io_where),
+            on_off_word(*state)
+        ),
+        Command::TioVout { mode } => {
+            let what = mode
+                .as_deref()
+                .map(|m| format!("set the tool IO supply to {m}"))
+                .unwrap_or_else(|| "query the tool IO supply".to_string());
+            info!(
+                "[dry-run] Will connect to controller {} and {what}",
+                args.ip
+            );
+        }
         Command::Rot { joint, deg, speed } => {
             info!(
                 "[dry-run] Will connect to controller {}, rotate joint J{} by {} degrees",
@@ -318,10 +347,14 @@ async fn drive(handle: &JKHD, command: &Command, stdout_fd: i32) -> Result<(), S
             // unreachable but the match must stay exhaustive
             Err("serve is not a drive command".into())
         }
+        Command::IoState => io_state(handle, stdout_fd),
+        Command::Di { io_where, index } => read_di(handle, stdout_fd, *io_where, *index),
         Command::PowerOn
         | Command::Rot { .. }
         | Command::Restore { .. }
-        | Command::MoveTo { .. } => {
+        | Command::MoveTo { .. }
+        | Command::Do { .. }
+        | Command::TioVout { .. } => {
             if st.estoped != 0 {
                 return Err(
                     "E-stop is pressed. Release the button physically, then run estop-clear".into(),
@@ -364,10 +397,194 @@ async fn drive(handle: &JKHD, command: &Command, stdout_fd: i32) -> Result<(), S
                     };
                     move_to(handle, *x, *y, *z, *speed, *rx, *ry, *rz, *rel, None, None).await
                 }
+                Command::Do {
+                    io_where,
+                    index,
+                    state,
+                } => write_do(
+                    handle,
+                    stdout_fd,
+                    *io_where,
+                    *index,
+                    matches!(state, OnOff::On),
+                ),
+                Command::TioVout { mode } => tio_vout(handle, stdout_fd, mode.as_deref()),
                 _ => Ok(()),
             }
         }
     }
+}
+
+/// The human readable name of an IO bank
+fn io_name(io_where: IoWhere) -> &'static str {
+    match io_where {
+        IoWhere::Tool => "tool",
+        IoWhere::Cabinet => "cabinet",
+    }
+}
+
+/// The SDK IO bank of an IO selection
+fn io_kind(io_where: IoWhere) -> binding::IOType {
+    match io_where {
+        IoWhere::Tool => binding::IOType::Tool,
+        IoWhere::Cabinet => binding::IOType::Cabinet,
+    }
+}
+
+/// The word of a digital state
+fn on_off_word(state: OnOff) -> &'static str {
+    match state {
+        OnOff::On => "on",
+        OnOff::Off => "off",
+    }
+}
+
+/// Probe every digital input and output of an IO bank. The scan stops at
+/// the first channel the controller rejects, which ends the valid range
+fn scan_digital(handle: &JKHD, io_where: IoWhere, outputs: bool) -> Vec<bool> {
+    let kind = io_kind(io_where);
+    let mut found = Vec::new();
+    for index in 0..32 {
+        let mut value: BOOL = 0;
+        let ret = if outputs {
+            unsafe { binding::get_digital_output(handle, kind, index, &mut value) }
+        } else {
+            unsafe { binding::get_digital_input(handle, kind, index, &mut value) }
+        };
+        if ret != binding::ERR_SUCC {
+            break;
+        }
+        found.push(value != 0);
+    }
+    found
+}
+
+/// Print every digital IO of the tool and the cabinet plus the tool IO
+/// supply voltage as JSON on the original stdout
+fn io_state(handle: &JKHD, stdout_fd: i32) -> Result<(), String> {
+    let tool_do = scan_digital(handle, IoWhere::Tool, true);
+    let tool_di = scan_digital(handle, IoWhere::Tool, false);
+    let cabinet_do = scan_digital(handle, IoWhere::Cabinet, true);
+    let cabinet_di = scan_digital(handle, IoWhere::Cabinet, false);
+    let mut vout_enable = 0;
+    let mut vout_vol = 0;
+    check("Read tool IO supply", unsafe {
+        binding::get_tio_vout_param(handle, &mut vout_enable, &mut vout_vol)
+    })?;
+    info!(
+        "Tool DI{} DO{}: {} inputs / {} outputs",
+        tool_di.len(),
+        tool_do.len(),
+        fmt_bits(&tool_di),
+        fmt_bits(&tool_do)
+    );
+    info!(
+        "Cabinet DI{} DO{}: {} inputs / {} outputs",
+        cabinet_di.len(),
+        cabinet_do.len(),
+        fmt_bits(&cabinet_di),
+        fmt_bits(&cabinet_do)
+    );
+    info!(
+        "Tool IO supply: {} at {} V",
+        if vout_enable != 0 { "on" } else { "off" },
+        if vout_vol == 0 { 24 } else { 12 }
+    );
+    let json = serde_json::json!({
+        "tool": {"di": tool_di, "do": tool_do},
+        "cabinet": {"di": cabinet_di, "do": cabinet_do},
+        "tio_vout": {
+            "enable": vout_enable != 0,
+            "voltage": if vout_vol == 0 { 24 } else { 12 },
+        },
+    });
+    binding::write_to_fd(stdout_fd, &format!("{json}\n"));
+    Ok(())
+}
+
+/// Format a bit list as 1s and 0s from the lowest channel up
+fn fmt_bits(bits: &[bool]) -> String {
+    bits.iter().map(|&b| if b { '1' } else { '0' }).collect()
+}
+
+/// Read one digital input and print it as JSON on the original stdout
+fn read_di(handle: &JKHD, stdout_fd: i32, io_where: IoWhere, index: i32) -> Result<(), String> {
+    let name = io_name(io_where);
+    let mut value: BOOL = 0;
+    check(&format!("Read {name} DI{index}"), unsafe {
+        binding::get_digital_input(handle, io_kind(io_where), index, &mut value)
+    })?;
+    info!(
+        "{name} DI{index} is {}",
+        if value != 0 { "on" } else { "off" }
+    );
+    let json = serde_json::json!({"di": index, "value": value != 0});
+    binding::write_to_fd(stdout_fd, &format!("{json}\n"));
+    Ok(())
+}
+
+/// Set one digital output and read it back, then print the state as JSON
+/// on the original stdout
+fn write_do(
+    handle: &JKHD,
+    stdout_fd: i32,
+    io_where: IoWhere,
+    index: i32,
+    on: bool,
+) -> Result<(), String> {
+    let name = io_name(io_where);
+    check(
+        &format!("Set {name} DO{index} to {}", if on { "on" } else { "off" }),
+        unsafe { binding::set_digital_output(handle, io_kind(io_where), index, on as BOOL) },
+    )?;
+    // Read back, the controller may clamp or refuse the requested state
+    let mut value: BOOL = 0;
+    check(&format!("Read back {name} DO{index}"), unsafe {
+        binding::get_digital_output(handle, io_kind(io_where), index, &mut value)
+    })?;
+    let actual = value != 0;
+    if actual != on {
+        warn!(
+            "{name} DO{index} stayed {}, the hardware may reject the change",
+            if actual { "on" } else { "off" }
+        );
+    }
+    info!("{name} DO{index} is {}", if actual { "on" } else { "off" });
+    let json = serde_json::json!({"do": index, "value": actual});
+    binding::write_to_fd(stdout_fd, &format!("{json}\n"));
+    Ok(())
+}
+
+/// Query the tool IO supply voltage, or set it when a mode is given. The
+/// printed JSON goes to the original stdout
+fn tio_vout(handle: &JKHD, stdout_fd: i32, mode: Option<&str>) -> Result<(), String> {
+    if let Some(m) = mode {
+        // 24 V or 12 V output, off disables the supply
+        let (enable, vol) = match m {
+            "24" => (1, 0),
+            "12" => (1, 1),
+            _ => (0, 0),
+        };
+        check("Set tool IO supply", unsafe {
+            binding::set_tio_vout_param(handle, enable, vol)
+        })?;
+    }
+    let mut enable = 0;
+    let mut vol = 0;
+    check("Read tool IO supply", unsafe {
+        binding::get_tio_vout_param(handle, &mut enable, &mut vol)
+    })?;
+    info!(
+        "Tool IO supply is {} at {} V",
+        if enable != 0 { "on" } else { "off" },
+        if vol == 0 { 24 } else { 12 }
+    );
+    let json = serde_json::json!({
+        "enable": enable != 0,
+        "voltage": if vol == 0 { 24 } else { 12 },
+    });
+    binding::write_to_fd(stdout_fd, &format!("{json}\n"));
+    Ok(())
 }
 
 /// Power on and enable the robot, skipping steps that are already done

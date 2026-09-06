@@ -16,6 +16,10 @@ Commands:
   move-to     Move the TCP to an absolute position, or with --rel to base plus an offset
   set-base    Save the current TCP position as the base pose for move-to --rel
   serve       Serve a TCP control protocol for a gamepad
+  io-state    Print every tool and cabinet digital input and output as JSON
+  di          Read one digital input of the tool or the cabinet
+  do          Set one digital output of the tool or the cabinet and read it back
+  tio-vout    Show or set the tool IO supply voltage, 24 V or 12 V
 
 Options:
   --ip <IP>       Controller IP address, defaults to 10.5.5.100
@@ -43,6 +47,18 @@ rot arguments:
   --deg <deg>     Rotation angle in degrees, negative reverses direction, defaults to 360
   --speed <rad/s> Joint speed in radians per second, defaults to 0.8
 
+IO:
+  The tool IO bank lives on the robot wrist, the cabinet bank on the
+  control cabinet. Digital outputs can drive a valve or a lamp, digital
+  inputs read a sensor. The tool IO supply must match the tool voltage.
+  jaka-cli di tool 0
+  jaka-cli do tool 0 on
+  jaka-cli do cabinet 3 off
+  jaka-cli tio-vout          # query
+  jaka-cli tio-vout 24       # supply the tool with 24 V
+  jaka-cli tio-vout 12
+  jaka-cli tio-vout off
+
 Log level:
   Controlled by the RUST_LOG environment variable, defaults to info
   RUST_LOG=debug jaka-cli status
@@ -67,4 +83,7 @@ Examples:
   jaka-cli inspect-pos > desk.json
   jaka-cli move-to --pose desk.json
   jaka-cli move-to --json '{"head_pos":[100,0,300],"head_rpy":[0,90,0]}'
+  jaka-cli io-state
+  jaka-cli do tool 0 on
+  jaka-cli tio-vout 24
   jaka-cli --dry-run rot --joint 3

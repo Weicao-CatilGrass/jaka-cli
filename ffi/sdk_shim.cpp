@@ -16,6 +16,11 @@ extern "C" {
     int disable_robot(const int *handle);
     int get_robot_state(const int *handle, void *state);
     int get_robot_status_simple(const int *handle, void *status);
+    int set_digital_output(const int *handle, int type, int index, int value);
+    int get_digital_output(const int *handle, int type, int index, int *value);
+    int get_digital_input(const int *handle, int type, int index, int *value);
+    int set_tio_vout_param(const int *handle, int vout_enable, int vout_vol);
+    int get_tio_vout_param(const int *handle, int *vout_enable, int *vout_vol);
     int get_joint_position(const int *handle, void *pos);
     int get_tcp_position(const int *handle, void *tcp_position);
     int get_dh_param(const int *handle, void *dh_param);
@@ -54,6 +59,11 @@ WRAP(enable_robot, (const int *handle), (handle))
 WRAP(disable_robot, (const int *handle), (handle))
 WRAP(get_robot_state, (const int *handle, void *state), (handle, state))
 WRAP(get_robot_status_simple, (const int *handle, void *status), (handle, status))
+WRAP(set_digital_output, (const int *handle, int type, int index, int value), (handle, type, index, value))
+WRAP(get_digital_output, (const int *handle, int type, int index, int *value), (handle, type, index, value))
+WRAP(get_digital_input, (const int *handle, int type, int index, int *value), (handle, type, index, value))
+WRAP(set_tio_vout_param, (const int *handle, int vout_enable, int vout_vol), (handle, vout_enable, vout_vol))
+WRAP(get_tio_vout_param, (const int *handle, int *vout_enable, int *vout_vol), (handle, vout_enable, vout_vol))
 WRAP(get_joint_position, (const int *handle, void *pos), (handle, pos))
 WRAP(get_tcp_position, (const int *handle, void *tcp_position), (handle, tcp_position))
 WRAP(get_dh_param, (const int *handle, void *dh_param), (handle, dh_param))
