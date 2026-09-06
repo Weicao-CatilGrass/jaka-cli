@@ -1292,6 +1292,8 @@ fn set_base(handle: &JKHD) -> Result<(), String> {
 enum ProtoCmd {
     /// Continuous velocity, translations in mm/s, rotations in deg/s
     Vel(f64, f64, f64, f64, f64, f64),
+    /// Drive one digital output: bank true = tool, index and state
+    Do(bool, i32, bool),
     EstopClear,
     PowerOn,
     PowerOff,
@@ -1566,6 +1568,23 @@ impl Backend {
                 state.advance();
                 state.jog = target;
             }
+        }
+    }
+
+    /// Drive one digital output of the tool or the cabinet bank
+    fn set_do(&mut self, tool: bool, index: i32, on: bool) -> Result<(), String> {
+        match self {
+            Backend::Real { handle, .. } => {
+                let io_type = if tool {
+                    binding::IOType::Tool
+                } else {
+                    binding::IOType::Cabinet
+                };
+                check(&format!("Set DO{index}"), unsafe {
+                    binding::set_digital_output(handle, io_type, index, on as BOOL)
+                })
+            }
+            Backend::Mock(state) => state.set_do(tool, index, on),
         }
     }
 
@@ -1852,6 +1871,10 @@ struct MockState {
     joints: [f64; 6],
     /// The jog velocity of each axis in protocol units, mm/s and deg/s
     jog: [f64; 6],
+    /// The digital outputs of the tool bank, driven by the do command
+    tool_do: [bool; 2],
+    /// The digital outputs of the cabinet bank
+    cabinet_do: [bool; 8],
     /// When the jog velocities were applied last
     last: Instant,
 }
@@ -1865,8 +1888,25 @@ impl MockState {
             head: HOME_HEAD,
             joints: HOME_JOINTS,
             jog: [0.0; 6],
+            tool_do: [false; 2],
+            cabinet_do: [false; 8],
             last: Instant::now(),
         }
+    }
+
+    /// Drive one digital output of a bank
+    fn set_do(&mut self, tool: bool, index: i32, on: bool) -> Result<(), String> {
+        let name = if tool { "tool" } else { "cabinet" };
+        let bank: &mut [bool] = if tool {
+            &mut self.tool_do
+        } else {
+            &mut self.cabinet_do
+        };
+        let slot = bank
+            .get_mut(index as usize)
+            .ok_or_else(|| format!("DO{index} is out of range for the {name} bank"))?;
+        *slot = on;
+        Ok(())
     }
 
     /// Integrate the jog velocities over the time since the last advance
@@ -1933,6 +1973,8 @@ impl MockState {
             "joints": self.joints,
             "head_pos": [self.head[0], self.head[1], self.head[2]],
             "head_rpy": [self.head[3], self.head[4], self.head[5]],
+            "tool_do": self.tool_do,
+            "cabinet_do": self.cabinet_do,
         });
         format!("status {json}\n")
     }
@@ -1963,6 +2005,26 @@ fn parse_proto(line: &str) -> Result<ProtoCmd, String> {
                 num(5)?,
                 num(6)?,
             ))
+        }
+        "do" => {
+            // do <tool|cabinet> <index> <on|off>
+            if parts.len() != 4 {
+                return Err("do expects: do <tool|cabinet> <index> <on|off>".into());
+            }
+            let tool = match parts[1] {
+                "tool" => true,
+                "cabinet" => false,
+                other => return Err(format!("do bank must be tool or cabinet, got {other}")),
+            };
+            let index: i32 = parts[2]
+                .parse()
+                .map_err(|_| format!("do index must be a number, got {}", parts[2]))?;
+            let on = match parts[3] {
+                "on" => true,
+                "off" => false,
+                other => return Err(format!("do state must be on or off, got {other}")),
+            };
+            Ok(ProtoCmd::Do(tool, index, on))
         }
         "estop-clear" => Ok(ProtoCmd::EstopClear),
         "poweron" => Ok(ProtoCmd::PowerOn),
@@ -2130,6 +2192,10 @@ async fn exec_cmd(backend: &mut Backend, cmd: ProtoCmd) -> Result<String, String
                 backend.ensure_servo()?;
             }
             backend.set_target(target);
+            Ok("ok\n".into())
+        }
+        ProtoCmd::Do(tool, index, on) => {
+            backend.set_do(tool, index, on)?;
             Ok("ok\n".into())
         }
         ProtoCmd::EstopClear => {

@@ -18,6 +18,8 @@ const MOVE_SCALE: f32 = 100.0;
 const ROTATE_SCALE: f32 = 20.0;
 /// Shoulder button velocity in mm/s while held
 const Z_SCALE: f32 = 40.0;
+/// Right trigger level that turns the tool outputs on
+const SUCTION_LEVEL: f32 = 0.5;
 /// How often a steady velocity is resent, so the serve side recovers when
 /// its servo stream stopped on an error
 const HEARTBEAT: Duration = Duration::from_millis(500);
@@ -42,6 +44,8 @@ struct Input {
     triangle: bool,
     dpad_up: bool,
     dpad_down: bool,
+    /// Right trigger level, 0 to 1, drives the tool outputs past half
+    r2: f32,
 }
 
 fn read_input(gp: &Gamepad) -> Input {
@@ -56,6 +60,12 @@ fn read_input(gp: &Gamepad) -> Input {
         triangle: gp.is_pressed(Button::North),
         dpad_up: gp.is_pressed(Button::DPadUp),
         dpad_down: gp.is_pressed(Button::DPadDown),
+        // The analog triggers arrive as button events carrying the axis
+        // level, 0 when released and 1 when fully pressed
+        r2: gp
+            .button_data(Button::RightTrigger2)
+            .map(|d| d.value())
+            .unwrap_or(0.0),
     }
 }
 
@@ -99,6 +109,8 @@ fn main() {
     // The velocity of the last sent vel command, NaN forces the first frame
     let mut prev_vel = [f32::NAN; 6];
     let mut last_sent = Instant::now();
+    // The suction state, driven by the right trigger past the half level
+    let mut prev_suck = false;
     loop {
         // Process the pending events. The gamepad mapping is only applied
         // and the cached state only updated inside next_event, without it
@@ -166,6 +178,16 @@ fn main() {
         }
         if inp.dpad_down && !prev.dpad_down {
             write_cmd(&mut stream, "poweroff");
+        }
+        // The right trigger past half drives both tool outputs, the typical
+        // valve wiring of a suction cup
+        let suck = inp.r2 >= SUCTION_LEVEL;
+        if suck != prev_suck {
+            let state = if suck { "on" } else { "off" };
+            for index in 0..2 {
+                write_cmd(&mut stream, &format!("do tool {index} {state}"));
+            }
+            prev_suck = suck;
         }
         prev = inp;
         // Scan at 100 Hz, only changed velocities produce a command

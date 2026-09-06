@@ -8,6 +8,8 @@ Controls:
   Left stick     Move the head in the base XY plane, up to 100 mm/s
   L1 / R1        Move down / up at 40 mm/s
   Right stick    Tilt the head (up down) and turn it (left right), up to 20 deg/s
+  R2 trigger     Past the half level turns tool DO0 and DO1 on (suction),
+                 released turns them off
   Cross          Clear the e-stop
   Triangle       Reset to the default pose
   D-pad up       Power on

@@ -31,6 +31,8 @@ serve protocol:
   vel <dx> <dy> <dz> <drx> <dry> <drz>
                       Continuous velocity, translations in mm/s, rotations
                       in deg/s. Zero stops the axis, the smooth gamepad mode
+  do <tool|cabinet> <index> <on|off>
+                      Drive one digital output of the tool or the cabinet
   estop-clear         Clear the e-stop error state
   poweron             Power on and enable the robot
   poweroff            Disable servos and power off
