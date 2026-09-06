@@ -51,6 +51,8 @@ IO:
   The tool IO bank lives on the robot wrist, the cabinet bank on the
   control cabinet. Digital outputs can drive a valve or a lamp, digital
   inputs read a sensor. The tool IO supply must match the tool voltage.
+  The Mini TIO defaults to NPN outputs: a PNP tool needs the DO pins
+  reconfigured while the servos are disabled, see scripts/init-tio-pnp.sh
   jaka-cli di tool 0
   jaka-cli do tool 0 on
   jaka-cli do cabinet 3 off
@@ -58,6 +60,9 @@ IO:
   jaka-cli tio-vout 24       # supply the tool with 24 V
   jaka-cli tio-vout 12
   jaka-cli tio-vout off
+  jaka-cli tio-pin do pnp    # DO1+DO2 to PNP, run while disabled
+  jaka-cli tio-pin di pnp     # DI to PNP inputs, run while disabled
+  jaka-cli tio-pin do         # query the current DO pin mode
 
 Log level:
   Controlled by the RUST_LOG environment variable, defaults to info

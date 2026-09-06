@@ -22,7 +22,7 @@ use binding::{
     RobotState, Rpy, check, errno_t,
 };
 use clap::Parser;
-use cli::{Cli, Command, IoWhere, OnOff};
+use cli::{Cli, Command, IoWhere, OnOff, TioPinBank};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
@@ -99,6 +99,14 @@ fn print_plan(args: &Cli, command: &Command) {
             "[dry-run] Will connect to controller {} and power on and enable",
             args.ip
         ),
+        Command::Enable => info!(
+            "[dry-run] Will connect to controller {} and enable the servos",
+            args.ip
+        ),
+        Command::Disable => info!(
+            "[dry-run] Will connect to controller {} and disable the servos",
+            args.ip
+        ),
         Command::PowerOff => info!(
             "[dry-run] Will connect to controller {} and disable servos and power off",
             args.ip
@@ -143,6 +151,16 @@ fn print_plan(args: &Cli, command: &Command) {
                 .as_deref()
                 .map(|m| format!("set the tool IO supply to {m}"))
                 .unwrap_or_else(|| "query the tool IO supply".to_string());
+            info!(
+                "[dry-run] Will connect to controller {} and {what}",
+                args.ip
+            );
+        }
+        Command::TioPin { bank, mode } => {
+            let what = mode
+                .as_deref()
+                .map(|m| format!("set the {bank:?} pin mode to 0x{m}"))
+                .unwrap_or_else(|| format!("query the {bank:?} pin mode"));
             info!(
                 "[dry-run] Will connect to controller {} and {what}",
                 args.ip
@@ -329,6 +347,15 @@ async fn drive(handle: &JKHD, command: &Command, stdout_fd: i32) -> Result<(), S
             print_dh_json(stdout_fd, &dh);
             Ok(())
         }
+        Command::Disable => {
+            if st.servo_enabled != 0 {
+                check("Disable servos", unsafe { binding::disable_robot(handle) })?;
+                info!("Servos disabled");
+            } else {
+                info!("Already disabled");
+            }
+            Ok(())
+        }
         Command::PowerOff => {
             if st.servo_enabled != 0 {
                 check("Disable servos", unsafe { binding::disable_robot(handle) })?;
@@ -349,7 +376,9 @@ async fn drive(handle: &JKHD, command: &Command, stdout_fd: i32) -> Result<(), S
         }
         Command::IoState => io_state(handle, stdout_fd),
         Command::Di { io_where, index } => read_di(handle, stdout_fd, *io_where, *index),
+        Command::TioPin { bank, mode } => tio_pin(handle, stdout_fd, *bank, mode.as_deref()),
         Command::PowerOn
+        | Command::Enable
         | Command::Rot { .. }
         | Command::Restore { .. }
         | Command::MoveTo { .. }
@@ -362,6 +391,7 @@ async fn drive(handle: &JKHD, command: &Command, stdout_fd: i32) -> Result<(), S
             }
             ensure_powered_enabled(handle, &st)?;
             match command {
+                Command::Enable => Ok(()),
                 Command::Rot { joint, deg, speed } => rot(handle, *joint, *deg, *speed).await,
                 Command::Restore { file, speed } => restore(handle, file.as_deref(), *speed).await,
                 Command::MoveTo {
@@ -409,6 +439,9 @@ async fn drive(handle: &JKHD, command: &Command, stdout_fd: i32) -> Result<(), S
                     matches!(state, OnOff::On),
                 ),
                 Command::TioVout { mode } => tio_vout(handle, stdout_fd, mode.as_deref()),
+                Command::TioPin { bank, mode } => {
+                    tio_pin(handle, stdout_fd, *bank, mode.as_deref())
+                }
                 _ => Ok(()),
             }
         }
@@ -471,6 +504,25 @@ fn io_state(handle: &JKHD, stdout_fd: i32) -> Result<(), String> {
     check("Read tool IO supply", unsafe {
         binding::get_tio_vout_param(handle, &mut vout_enable, &mut vout_vol)
     })?;
+    // The pin roles show whether a tool talks over the digital IO or the
+    // RS485 serial channels that reuse the DO and AI pins
+    let mut pin_mode = [0; 3];
+    for pin_type in 0..3 {
+        check(&format!("Read TIO pin mode {pin_type}"), unsafe {
+            binding::get_tio_pin_mode(handle, pin_type, &mut pin_mode[pin_type as usize])
+        })?;
+    }
+    let mut rs485 = [0; 2];
+    for chn in 0..2 {
+        let ret = unsafe { binding::get_rs485_chn_mode(handle, chn, &mut rs485[chn as usize]) };
+        if ret != binding::ERR_SUCC {
+            rs485[chn as usize] = -1;
+        }
+    }
+    info!(
+        "TIO pin modes: DI {:#04x}, DO {:#04x}, AI {:#04x}",
+        pin_mode[0], pin_mode[1], pin_mode[2]
+    );
     info!(
         "Tool DI{} DO{}: {} inputs / {} outputs",
         tool_di.len(),
@@ -497,6 +549,8 @@ fn io_state(handle: &JKHD, stdout_fd: i32) -> Result<(), String> {
             "enable": vout_enable != 0,
             "voltage": if vout_vol == 0 { 24 } else { 12 },
         },
+        "tio_pin_mode": {"di": pin_mode[0], "do": pin_mode[1], "ai": pin_mode[2]},
+        "rs485": [rs485[0], rs485[1]],
     });
     binding::write_to_fd(stdout_fd, &format!("{json}\n"));
     Ok(())
@@ -585,6 +639,89 @@ fn tio_vout(handle: &JKHD, stdout_fd: i32, mode: Option<&str>) -> Result<(), Str
     });
     binding::write_to_fd(stdout_fd, &format!("{json}\n"));
     Ok(())
+}
+
+/// Query or set the TIO pin role of one bank. The mode accepts the names
+/// npn, pnp, push-pull, rs485 and analog, or a raw hex byte. The layout
+/// follows the SDK: DI packs two NPN/PNP bits per channel, DO packs two
+/// nibbles (low = DO1, high = DO2, 0x0 NPN, 0x1 PNP, 0x2 push-pull,
+/// 0xF RS485) and AI is 0 = analog or 1 = RS485L. The resulting JSON goes
+/// to the original stdout
+fn tio_pin(
+    handle: &JKHD,
+    stdout_fd: i32,
+    bank: TioPinBank,
+    mode: Option<&str>,
+) -> Result<(), String> {
+    let pin_type = match bank {
+        TioPinBank::Di => 0,
+        TioPinBank::Do => 1,
+        TioPinBank::Ai => 2,
+    };
+    if let Some(text) = mode {
+        let value = parse_pin_mode(bank, text)?;
+        check("Set TIO pin mode", unsafe {
+            binding::set_tio_pin_mode(handle, pin_type, value)
+        })?;
+    }
+    let mut current = 0;
+    check("Read TIO pin mode", unsafe {
+        binding::get_tio_pin_mode(handle, pin_type, &mut current)
+    })?;
+    info!(
+        "{:?} pin mode is 0x{current:02x} ({})",
+        bank,
+        pin_mode_name(bank, current)
+    );
+    let json = serde_json::json!({
+        "bank": format!("{:?}", bank).to_lowercase(),
+        "mode": format!("{current:02x}"),
+        "mode_name": pin_mode_name(bank, current),
+    });
+    binding::write_to_fd(stdout_fd, &format!("{json}\n"));
+    Ok(())
+}
+
+/// Resolve a pin mode name or raw hex byte to the SDK byte value
+fn parse_pin_mode(bank: TioPinBank, text: &str) -> Result<i32, String> {
+    let name = text.to_ascii_lowercase();
+    let named = match (bank, name.as_str()) {
+        (_, "npn") => Some(0x00),
+        (_, "pnp") => Some(0x11),
+        (TioPinBank::Do, "push-pull") => Some(0x22),
+        (TioPinBank::Do, "rs485") => Some(0xff),
+        (TioPinBank::Ai, "rs485") => Some(0x01),
+        (TioPinBank::Ai, "analog") => Some(0x00),
+        _ => None,
+    };
+    if let Some(v) = named {
+        return Ok(v);
+    }
+    // Fall back to the raw hex byte, still only the nibbles are defined
+    let value = i32::from_str_radix(text, 16).map_err(|_| {
+        format!(
+            "unknown mode {text:?} for {bank:?} pins, use npn, pnp, push-pull, rs485, analog or a hex byte"
+        )
+    })?;
+    if !(0..=0xFF).contains(&value) {
+        return Err(format!("mode 0x{text} is out of the byte range"));
+    }
+    Ok(value)
+}
+
+/// The readable name of a pin mode byte
+/// The readable name of a pin mode byte
+fn pin_mode_name(bank: TioPinBank, mode: i32) -> String {
+    match (bank, mode) {
+        (_, 0x00) => "npn".into(),
+        (_, 0x11) => "pnp".into(),
+        (TioPinBank::Do, 0x22) => "push-pull".into(),
+        (TioPinBank::Do, 0xff) => "rs485".into(),
+        (TioPinBank::Ai, 0x01) => "rs485l".into(),
+        (TioPinBank::Di, 0x01 | 0x10) => "mixed npn/pnp".into(),
+        (TioPinBank::Do, 0x01 | 0x10 | 0x20 | 0x02 | 0x12) => "mixed".into(),
+        _ => "custom".into(),
+    }
 }
 
 /// Power on and enable the robot, skipping steps that are already done

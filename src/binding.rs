@@ -203,6 +203,15 @@ unsafe extern "C" {
         vout_enable: *mut i32,
         vout_vol: *mut i32,
     ) -> errno_t;
+    /// Read the TIO pin mode: 0 = DI pins, 1 = DO pins, 2 = AI pins
+    #[link_name = "jk_safe_get_tio_pin_mode"]
+    pub fn get_tio_pin_mode(handle: *const JKHD, pin_type: i32, pin_mode: *mut i32) -> errno_t;
+    /// Set the TIO pin mode: 0 = DI pins, 1 = DO pins, 2 = AI pins
+    #[link_name = "jk_safe_set_tio_pin_mode"]
+    pub fn set_tio_pin_mode(handle: *const JKHD, pin_type: i32, pin_mode: i32) -> errno_t;
+    /// Read the RS485 channel mode: 0 = RS485H, 1 = RS485L
+    #[link_name = "jk_safe_get_rs485_chn_mode"]
+    pub fn get_rs485_chn_mode(handle: *const JKHD, chn_id: i32, chn_mode: *mut i32) -> errno_t;
     #[link_name = "jk_safe_get_dh_param"]
     pub fn get_dh_param(handle: *const JKHD, dh_param: *mut DHParam) -> errno_t;
     #[link_name = "jk_safe_get_joint_position"]

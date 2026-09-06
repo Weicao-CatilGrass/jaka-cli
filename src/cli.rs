@@ -13,6 +13,14 @@ pub enum IoWhere {
     Cabinet,
 }
 
+/// The TIO pin bank to configure
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum TioPinBank {
+    Di,
+    Do,
+    Ai,
+}
+
 /// A digital state word, accepts on/off
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum OnOff {
@@ -57,6 +65,14 @@ pub enum Command {
     /// Power on and enable the robot to hold position
     #[command(disable_help_flag = true)]
     PowerOn,
+
+    /// Enable the servos to hold position, robot must be powered
+    #[command(disable_help_flag = true)]
+    Enable,
+
+    /// Disable the servos, the robot goes limp but stays powered
+    #[command(disable_help_flag = true)]
+    Disable,
 
     /// Disable servos and power off
     #[command(disable_help_flag = true)]
@@ -211,6 +227,26 @@ pub enum Command {
     TioVout {
         /// The supply mode: 24, 12 or off, query when omitted
         #[arg(value_name = "24|12|OFF", value_parser = ["24", "12", "off"])]
+        mode: Option<String>,
+    },
+
+    /// Configure the TIO pin roles. The mode is a hex byte or a name: npn,
+    /// pnp, push-pull (DO only), rs485 (DO = both channels, AI = RS485L) or
+    /// analog (AI only). The raw hex byte is accepted as well: DO pins 0x0
+    /// NPN, 0x1 PNP, 0x2 push-pull, 0xF RS485, the low nibble is DO1 and the
+    /// high nibble DO2. AI pins 0 = analog, 1 = RS485L. DI pins pack two
+    /// NPN/PNP bits per channel. Omit the mode to query
+    ///
+    /// The controller silently ignores the change while the servos are
+    /// enabled: disable the robot first, configure, then enable again
+    #[command(disable_help_flag = true)]
+    TioPin {
+        /// The pin bank: di, do or ai
+        #[arg(value_enum, value_name = "DI|DO|AI")]
+        bank: TioPinBank,
+
+        /// The new mode as a hex byte, query when omitted
+        #[arg(value_name = "HEX")]
         mode: Option<String>,
     },
 }
