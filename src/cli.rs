@@ -52,6 +52,12 @@ pub struct Cli {
     #[arg(long, short = 'h')]
     pub help: bool,
 
+    /// Run several commands in one connected session. Each value is a whole
+    /// command line as it would follow jaka-cli, for example
+    /// --sequence "move-to 100 0 0 --rel" "status"
+    #[arg(long, value_name = "CMD", num_args = 1.., action = clap::ArgAction::Append)]
+    pub sequence: Vec<String>,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -170,6 +176,67 @@ pub enum Command {
         rz: Option<f64>,
     },
 
+    /// Move the TCP along a rising arc from the current pose to a base-frame
+    /// point. The path peaks apex mm above the straight line, so a carried
+    /// load clears the table on the way, and ends exactly on the point
+    #[command(disable_help_flag = true)]
+    Arc {
+        /// X coordinate in mm in the base frame
+        #[arg(value_name = "X", allow_negative_numbers = true)]
+        x: f64,
+
+        /// Y coordinate in mm in the base frame
+        #[arg(value_name = "Y", allow_negative_numbers = true)]
+        y: f64,
+
+        /// Z coordinate in mm in the base frame
+        #[arg(value_name = "Z", allow_negative_numbers = true)]
+        z: f64,
+
+        /// Rise of the arc peak above the straight start-to-end line in mm
+        #[arg(long, default_value_t = 60.0, allow_negative_numbers = true)]
+        apex: f64,
+
+        /// Linear speed in mm/s
+        #[arg(long, default_value_t = 100.0)]
+        speed: f64,
+
+        /// Treat x y z as offsets from the base pose instead of absolute coordinates
+        #[arg(long)]
+        rel: bool,
+    },
+
+    /// Move the TCP to an absolute base-frame point, or with --rel to a
+    /// position relative to the base pose. The whole pick is one continuous
+    /// servo motion: it rises from the current pose to hover over the source
+    /// block, probes down and grabs it, carries it in an arc to hover over
+    /// the target, probes down to seat it, releases the suction and lifts
+    /// away, with no stop between the motions
+    #[command(disable_help_flag = true)]
+    Grab {
+        /// Source block X offset in mm in the base frame
+        #[arg(value_name = "FROM_X", allow_negative_numbers = true)]
+        fromx: f64,
+        /// Source block Y offset in mm
+        #[arg(value_name = "FROM_Y", allow_negative_numbers = true)]
+        fromy: f64,
+        /// Target X offset in mm
+        #[arg(value_name = "TO_X", allow_negative_numbers = true)]
+        tox: f64,
+        /// Target Y offset in mm
+        #[arg(value_name = "TO_Y", allow_negative_numbers = true)]
+        toy: f64,
+        /// Rise of the carry arc above the straight line in mm
+        #[arg(long, default_value_t = 80.0, allow_negative_numbers = true)]
+        apex: f64,
+        /// Linear speed in mm/s, the servo caps it itself
+        #[arg(long, default_value_t = 2000.0)]
+        speed: f64,
+        /// Treat the offsets as relative to the base pose
+        #[arg(long)]
+        rel: bool,
+    },
+
     /// Save the current TCP position as the base pose for move-to
     #[command(disable_help_flag = true)]
     SetBase,
@@ -249,4 +316,17 @@ pub enum Command {
         #[arg(value_name = "HEX")]
         mode: Option<String>,
     },
+}
+
+/// A minimal CLI wrapper used to re-parse one command line of a --sequence.
+/// The global options are ignored, only the subcommand is taken
+#[derive(Parser, Debug)]
+#[command(
+    name = "jaka-cli",
+    disable_help_flag = true,
+    disable_version_flag = true
+)]
+pub struct SeqCommand {
+    #[command(subcommand)]
+    pub command: Option<Command>,
 }

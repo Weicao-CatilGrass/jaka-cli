@@ -14,6 +14,7 @@ Commands:
   rot         Power on, enable, then rotate the specified joint
   restore     Restore the joint angles recorded by inspect from a JSON file
   move-to     Move the TCP to an absolute position, or with --rel to base plus an offset
+  arc         Move the TCP along a rising arc to a point, for carrying a load over the table
   set-base    Save the current TCP position as the base pose for move-to --rel
   serve       Serve a TCP control protocol for a gamepad
   io-state    Print every tool and cabinet digital input and output as JSON
@@ -48,6 +49,16 @@ rot arguments:
   --joint <1-6>   Joint to rotate, from 1 to 6, defaults to 6
   --deg <deg>     Rotation angle in degrees, negative reverses direction, defaults to 360
   --speed <rad/s> Joint speed in radians per second, defaults to 0.8
+
+arc arguments:
+  <X> <Y> <Z>      Endpoint in mm, the arc ends exactly on it
+  --rel            Treat X Y Z as offsets from the base pose
+  --apex <mm>      Rise of the arc peak above the straight line, defaults to 60
+  --speed <mm/s>   Linear speed, defaults to 100
+
+The arc rises to the apex and back in a smooth sampled curve, so a carried
+load clears the table on the way. Use it to move a grabbed block from above
+one spot to above another instead of a low straight drag.
 
 IO:
   The tool IO bank lives on the robot wrist, the cabinet bank on the
@@ -87,6 +98,7 @@ Examples:
   jaka-cli move-to 100 0 0
   jaka-cli move-to 100 0 0 --rx 90
   jaka-cli move-to -50 0 400 --rel
+  jaka-cli arc 360 -200 -110 --rel --apex 80   # carry a block in an arc over the table
   jaka-cli inspect-pos > desk.json
   jaka-cli move-to --pose desk.json
   jaka-cli move-to --json '{"head_pos":[100,0,300],"head_rpy":[0,90,0]}'

@@ -68,9 +68,37 @@ async fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // Sequence mode: parse every quoted command and run them in one session
+    if !args.sequence.is_empty() {
+        if args.command.is_some() {
+            error!("--sequence cannot be combined with a direct subcommand");
+            return ExitCode::FAILURE;
+        }
+        let cmds = match parse_sequence(&args.sequence) {
+            Ok(c) => c,
+            Err(e) => {
+                error!("{e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if args.dry_run {
+            for cmd in &cmds {
+                print_plan(&args, cmd);
+            }
+            return ExitCode::SUCCESS;
+        }
+        return match run_sequence(&args, &cmds).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                error!("{e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     let Some(command) = &args.command else {
         error!(
-            "No subcommand given. Expected one of status, power-on, power-off, estop-clear, inspect, inspect-pos, dh, set-base, rot, restore, move-to, serve, io-state, di, do, tio-vout. Use --help for usage"
+            "No subcommand given. Expected one of status, power-on, power-off, estop-clear, inspect, inspect-pos, dh, set-base, rot, restore, move-to, arc, grab, serve, io-state, di, do, tio-vout. Use --help for usage"
         );
         return ExitCode::FAILURE;
     };
@@ -234,6 +262,39 @@ fn print_plan(args: &Cli, command: &Command) {
             }
             info!("[dry-run] Linear speed {speed:.0} mm/s, out-of-workspace targets get clamped");
         }
+        Command::Arc {
+            x,
+            y,
+            z,
+            apex,
+            speed,
+            rel,
+        } => {
+            let mode = if *rel { "base + offset" } else { "absolute" };
+            info!(
+                "[dry-run] Will connect to controller {} and arc the TCP to {mode} position ({x}, {y}, {z}) mm",
+                args.ip
+            );
+            info!(
+                "[dry-run] Arc apex {apex:.0} mm above the straight line, linear speed {speed:.0} mm/s"
+            );
+        }
+        Command::Grab {
+            fromx,
+            fromy,
+            tox,
+            toy,
+            apex,
+            speed,
+            rel,
+        } => {
+            let mode = if *rel { "base + offset" } else { "absolute" };
+            info!(
+                "[dry-run] Will connect to controller {} and run one continuous grab from ({fromx}, {fromy}) to ({tox}, {toy}) mm ({mode})",
+                args.ip
+            );
+            info!("[dry-run] Carry apex {apex:.0} mm, linear speed {speed:.0} mm/s");
+        }
         Command::SetBase => info!(
             "[dry-run] Will connect to controller {} and save the current TCP as the base pose",
             args.ip
@@ -289,6 +350,108 @@ async fn run(args: &Cli, command: &Command) -> Result<(), String> {
         }
         _ => drive(&handle, command, stdout_fd).await,
     };
+    let ret = unsafe { binding::destory_handler(&handle) };
+    if ret != binding::ERR_SUCC {
+        error!("Disconnect failed with error code {ret}");
+    }
+    result
+}
+
+/// Tokenize one command line into words, respecting single and double quotes
+/// and backslash escapes, so arguments with spaces stay together
+fn tokenize(line: &str) -> Result<Vec<String>, String> {
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                } else if c == '\\' && q == '"' {
+                    if let Some(n) = chars.next() {
+                        cur.push(n);
+                    }
+                } else {
+                    cur.push(c);
+                }
+            }
+            None => match c {
+                '"' | '\'' => quote = Some(c),
+                '\\' => {
+                    if let Some(n) = chars.next() {
+                        cur.push(n);
+                    }
+                }
+                c if c.is_whitespace() => {
+                    if !cur.is_empty() {
+                        words.push(std::mem::take(&mut cur));
+                    }
+                }
+                c => cur.push(c),
+            },
+        }
+    }
+    if let Some(q) = quote {
+        return Err(format!(
+            "Unterminated {q} quote in sequence command {line:?}"
+        ));
+    }
+    if !cur.is_empty() {
+        words.push(cur);
+    }
+    Ok(words)
+}
+
+/// Parse every quoted command line of a --sequence into a subcommand
+fn parse_sequence(lines: &[String]) -> Result<Vec<Command>, String> {
+    let mut cmds = Vec::new();
+    for line in lines {
+        let words = tokenize(line)?;
+        if words.is_empty() {
+            continue;
+        }
+        let mut argv = vec!["jaka-cli"];
+        argv.extend(words.iter().map(|w| w.as_str()));
+        let parsed = cli::SeqCommand::try_parse_from(argv)
+            .map_err(|e| format!("Invalid sequence command {line:?}: {e}"))?;
+        let Some(cmd) = parsed.command else {
+            return Err(format!("Sequence command {line:?} has no subcommand"));
+        };
+        cmds.push(cmd);
+    }
+    if cmds.is_empty() {
+        return Err("No commands given after --sequence".into());
+    }
+    Ok(cmds)
+}
+
+/// Run several commands in one connected session, so a behavior script does
+/// not pay the connect cost for every step. Stops at the first failure
+async fn run_sequence(args: &Cli, cmds: &[Command]) -> Result<(), String> {
+    let ip = CString::new(args.ip.as_str()).map_err(|_| "IP contains invalid characters")?;
+    let stdout_fd = binding::redirect_stdout_to_stderr();
+    let mut handle: JKHD = 0;
+    check("Connect controller", unsafe {
+        binding::create_handler(ip.as_ptr(), &mut handle)
+    })?;
+    info!("Connected to controller {}", args.ip);
+
+    let total = cmds.len();
+    let mut result = Ok(());
+    for (i, cmd) in cmds.iter().enumerate() {
+        info!("Sequence step {}/{}", i + 1, total);
+        if matches!(cmd, Command::Serve { .. }) {
+            result = Err("serve cannot run inside --sequence".into());
+            break;
+        }
+        if let Err(e) = drive(&handle, cmd, stdout_fd).await {
+            result = Err(e);
+            break;
+        }
+    }
+
     let ret = unsafe { binding::destory_handler(&handle) };
     if ret != binding::ERR_SUCC {
         error!("Disconnect failed with error code {ret}");
@@ -382,6 +545,8 @@ async fn drive(handle: &JKHD, command: &Command, stdout_fd: i32) -> Result<(), S
         | Command::Rot { .. }
         | Command::Restore { .. }
         | Command::MoveTo { .. }
+        | Command::Arc { .. }
+        | Command::Grab { .. }
         | Command::Do { .. }
         | Command::TioVout { .. } => {
             if st.estoped != 0 {
@@ -427,6 +592,23 @@ async fn drive(handle: &JKHD, command: &Command, stdout_fd: i32) -> Result<(), S
                     };
                     move_to(handle, *x, *y, *z, *speed, *rx, *ry, *rz, *rel, None, None).await
                 }
+                Command::Arc {
+                    x,
+                    y,
+                    z,
+                    apex,
+                    speed,
+                    rel,
+                } => arc(handle, *x, *y, *z, *apex, *speed, *rel).await,
+                Command::Grab {
+                    fromx,
+                    fromy,
+                    tox,
+                    toy,
+                    apex,
+                    speed,
+                    rel,
+                } => grab(handle, *fromx, *fromy, *tox, *toy, *apex, *speed, *rel).await,
                 Command::Do {
                     io_where,
                     index,
@@ -1179,6 +1361,437 @@ async fn move_to(
         goal.tran.x, goal.tran.y, goal.tran.z
     );
     report_final(handle, &goal).await
+}
+
+/// Move the TCP along a rising arc to a base-frame point. The path peaks
+/// apex mm above the straight start-to-end line, keeping a carried load
+/// clear of the table on the way, and ends exactly on the point. There is no
+/// circular move in the SDK, so the arc is sampled into short straight
+/// chords, each driven by a blocking linear move. The orientation stays the
+/// current one, the pose a grab tool keeps pointing down along the whole arc
+async fn arc(
+    handle: &JKHD,
+    x: f64,
+    y: f64,
+    z: f64,
+    apex: f64,
+    speed: f64,
+    rel: bool,
+) -> Result<(), String> {
+    // The endpoint is absolute, or the base pose plus the offset in rel mode
+    let (tx, ty, tz) = if rel {
+        let (base, from_file) = load_base(handle)?;
+        if from_file {
+            info!(
+                "Base pose from {} in mm: x={:.1}, y={:.1}, z={:.1}",
+                BASE_FILE, base.tran.x, base.tran.y, base.tran.z
+            );
+        }
+        (base.tran.x + x, base.tran.y + y, base.tran.z + z)
+    } else {
+        (x, y, z)
+    };
+
+    if apex < 0.0 {
+        return Err("apex must be >= 0 mm".into());
+    }
+
+    let mut cur = CartesianPose::zero();
+    check("Read TCP position", unsafe {
+        binding::get_tcp_position(handle, &mut cur)
+    })?;
+
+    let dx = tx - cur.tran.x;
+    let dy = ty - cur.tran.y;
+    let dz = tz - cur.tran.z;
+    let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+    if dist < 0.5 {
+        info!("Already at the arc endpoint, nothing to move");
+        return Ok(());
+    }
+
+    // A servo stream feeds an absolute pose every 8 ms without ever stopping,
+    // so the arc is continuous instead of a chain of stalling line moves
+    const ARC_ACC: f64 = 400.0; // feed acceleration, mm/s^2
+    const ARC_MAX: f64 = 250.0; // feed cap, mm/s
+    const TAU: f64 = 1e-4; // step for the numerical path metric
+
+    // The arc is a parabola in z over the straight start-to-end line: x and y
+    // go linearly, z rises to apex in the middle and returns to the line at
+    // both ends, so the motion ends exactly on the endpoint
+    let (sx, sy, sz) = (cur.tran.x, cur.tran.y, cur.tran.z);
+    if sz < LOW_Z || tz < LOW_Z {
+        return Err(format!(
+            "Arc goes below the safe height {LOW_Z} mm, raise the apex or the endpoint"
+        ));
+    }
+    let path = |u: f64| {
+        let z = sz + dz * u + apex * 4.0 * u * (1.0 - u);
+        (sx + dx * u, sy + dy * u, z)
+    };
+    // The local scale |dP/du|, turns an arc-length speed into a parameter rate
+    let metric = |u: f64| {
+        let a = path(u - TAU);
+        let b = path(u + TAU);
+        ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2) + (b.2 - a.2).powi(2)).sqrt() / (2.0 * TAU)
+    };
+    // The total arc length, a midpoint sum over the parameter range
+    const SEGS: usize = 512;
+    let mut len = 0.0;
+    for k in 0..SEGS {
+        len += metric((k as f64 + 0.5) / SEGS as f64) / SEGS as f64;
+    }
+
+    // The feed speed, capped so the joints stay within the servo filter
+    let v = if speed > ARC_MAX {
+        warn!("Speed {speed:.0} mm/s exceeds the servo cap, clamped to {ARC_MAX:.0} mm/s");
+        ARC_MAX
+    } else if speed > 0.0 {
+        speed
+    } else {
+        return Err("speed must be > 0 mm/s".into());
+    };
+    info!(
+        "Arc endpoint in mm: x={tx:.1}, y={ty:.1}, z={tz:.1}, apex {apex:.0} mm, {len:.0} mm path at up to {v:.0} mm/s"
+    );
+
+    // Sample the arc with a trapezoidal feed profile: accelerate up to the
+    // cruise speed, then decelerate to stop exactly on the endpoint
+    let dt = SERVO_PERIOD.as_secs_f64();
+    let mut u = 0.0;
+    let mut s = 0.0;
+    let mut vel = 0.0;
+    let mut poses: Vec<(f64, f64, f64)> = vec![(sx, sy, sz)];
+    loop {
+        let remain = (len - s).max(0.0);
+        let vstop = (2.0 * ARC_ACC * remain).sqrt();
+        let vcap = v.min(vstop);
+        if vel < vcap {
+            vel = (vel + ARC_ACC * dt).min(vcap);
+        } else if vel > vcap {
+            vel = (vel - ARC_ACC * dt).max(vcap);
+        }
+        let m = metric(u);
+        let du = if m > 1e-9 { vel * dt / m } else { 0.0 };
+        u = (u + du).min(1.0);
+        s += vel * dt;
+        poses.push(path(u));
+        if u >= 1.0 - 1e-9 || s >= len - 1e-6 {
+            break;
+        }
+        if poses.len() > 20000 {
+            return Err("Arc trajectory did not converge".into());
+        }
+    }
+    if let Some(last) = poses.last_mut() {
+        *last = path(1.0);
+    }
+    info!("Arc sampled into {} servo points", poses.len());
+
+    // Enter servo mode: the joint filter must be set before enabling, the
+    // controller rejects filter changes while servoing
+    let h = *handle;
+    if unsafe { binding::servo_move_use_joint_NLF(&h, NLF_VR, NLF_AR, NLF_JR) } != binding::ERR_SUCC
+    {
+        warn!("Joint NLF filter is not supported, running without it");
+    }
+    check("Enable servo mode", unsafe {
+        binding::servo_move_enable(&h, 1)
+    })?;
+
+    // Stream the sampled poses one per controller interpolation cycle
+    let mut ticker = tokio::time::interval(SERVO_PERIOD);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut send_err: Option<String> = None;
+    for (x, y, z) in &poses {
+        ticker.tick().await;
+        let mut pose = CartesianPose::zero();
+        pose.tran.x = *x;
+        pose.tran.y = *y;
+        pose.tran.z = *z;
+        pose.rpy.rx = cur.rpy.rx;
+        pose.rpy.ry = cur.rpy.ry;
+        pose.rpy.rz = cur.rpy.rz;
+        let ret = unsafe { binding::servo_p(&h, &pose, MoveMode::Abs, 1) };
+        if ret != binding::ERR_SUCC {
+            send_err = Some(format!("Servo pulse rejected: {}", servo_err_hint(ret)));
+            break;
+        }
+    }
+    // The endpoint pose, used to hold the arm before leaving servo
+    let mut final_pose = CartesianPose::zero();
+    final_pose.tran.x = tx;
+    final_pose.tran.y = ty;
+    final_pose.tran.z = tz;
+    final_pose.rpy.rx = cur.rpy.rx;
+    final_pose.rpy.ry = cur.rpy.ry;
+    final_pose.rpy.rz = cur.rpy.rz;
+
+    // Hold the endpoint a few cycles so the controller finishes the last
+    // pulse, then leave servo. An immediate disable can be rejected
+    if let Some(e) = send_err {
+        let _ = unsafe { binding::motion_abort(&h) };
+        let _ = unsafe { binding::servo_move_enable(&h, 0) };
+        return Err(e);
+    }
+    for _ in 0..6 {
+        ticker.tick().await;
+        let ret = unsafe { binding::servo_p(&h, &final_pose, MoveMode::Abs, 1) };
+        if ret != binding::ERR_SUCC {
+            warn!("Holding the endpoint failed: {}", servo_err_hint(ret));
+            break;
+        }
+    }
+    let _ = tokio::time::sleep(Duration::from_millis(32)).await;
+    let mut off = unsafe { binding::servo_move_enable(&h, 0) };
+    if off != binding::ERR_SUCC {
+        let _ = tokio::time::sleep(Duration::from_millis(64)).await;
+        off = unsafe { binding::servo_move_enable(&h, 0) };
+    }
+    if off != binding::ERR_SUCC {
+        // The controller leaves servo mode on its own once the stream stops,
+        // so this disable is often already a no-op and returns an error.
+        // Normal point motions still work after the arc, so it is benign
+        warn!(
+            "Disable servo mode returned {}, the arm already left servo mode",
+            servo_err_hint(off)
+        );
+    }
+    info!("Arc complete");
+
+    let mut goal = cur;
+    goal.tran.x = tx;
+    goal.tran.y = ty;
+    goal.tran.z = tz;
+    report_final(handle, &goal).await
+}
+
+/// Pick a block at (fromx, fromy) and carry it to (tox, toy) in one
+/// continuous servo trajectory. The offsets are relative to the base pose,
+/// so a --rel grab expects the block on the table under the base point.
+/// The motion is a single stream: rise to hover over the source, probe down
+/// to grab (suction on, hold), arc over to hover above the target, probe
+/// down to seat (suction off, hold), lift away. There is no stop between
+/// the segments, only the two suction dwells
+async fn grab(
+    handle: &JKHD,
+    fromx: f64,
+    fromy: f64,
+    tox: f64,
+    toy: f64,
+    apex: f64,
+    speed: f64,
+    rel: bool,
+) -> Result<(), String> {
+    if !rel {
+        return Err("grab coordinates are offsets from the base, use --rel".into());
+    }
+    if apex < 0.0 {
+        return Err("apex must be >= 0 mm".into());
+    }
+    const APPROACH_OFF: f64 = -110.0; // hover height above the block top
+    const GRAB_OFF: f64 = -125.0; // head height where the cup touches a block
+    const GRAB_HOLD: f64 = 0.6; // seconds of suction on the source block
+    const SEAT_HOLD: f64 = 0.4; // seconds of rest after seating the block
+    const ARC_MAX: f64 = 250.0; // feed cap, the servo filter softens faster
+
+    let (base, _) = load_base(handle)?;
+    let v = if speed > ARC_MAX {
+        warn!("Speed {speed:.0} mm/s exceeds the servo cap, clamped to {ARC_MAX:.0} mm/s");
+        ARC_MAX
+    } else {
+        speed.max(1.0)
+    };
+
+    let (bx, by, bz) = (base.tran.x, base.tran.y, base.tran.z);
+    let (az, gz) = (bz + APPROACH_OFF, bz + GRAB_OFF);
+    let a = (bx + fromx, by + fromy, az);
+    let b = (bx + fromx, by + fromy, gz);
+    let s = (bx + tox, by + toy, gz);
+    let t = (bx + tox, by + toy, az);
+
+    let mut cur = CartesianPose::zero();
+    check("Read TCP position", unsafe {
+        binding::get_tcp_position(handle, &mut cur)
+    })?;
+    let c = (cur.tran.x, cur.tran.y, cur.tran.z);
+
+    info!("Continuous grab from rel ({fromx}, {fromy}) to rel ({tox}, {toy}) at up to {v:.0} mm/s");
+
+    // Concatenate the segments into one pose stream. Each segment ends at
+    // rest, so the only deliberate dwells are the suction on and off points
+    let cadence = SERVO_PERIOD.saturating_mul(2); // 16 ms, match the real tick
+    let dt = cadence.as_secs_f64();
+    let mut out: Vec<(f64, f64, f64)> = Vec::new();
+    let mut events: Vec<(usize, bool)> = Vec::new();
+    let hold_ticks = ((GRAB_HOLD / dt) as usize).max(1);
+    let seat_ticks = ((SEAT_HOLD / dt) as usize).max(1);
+
+    // Rise from the current pose to hover over the source, then probe down
+    out.extend(seg_positions(c, a, apex, v));
+    out.extend(seg_positions(a, b, 0.0, v));
+    // Arrive on the block top, grip it, dwell so the suction holds
+    let on_at = out.len() - 1;
+    events.push((on_at, true));
+    for _ in 0..hold_ticks {
+        out.push(b);
+    }
+    // Carry in an arc to hover over the target, then probe down to seat it
+    out.extend(seg_positions(b, s, apex, v));
+    let off_at = out.len() - 1;
+    events.push((off_at, false));
+    for _ in 0..seat_ticks {
+        out.push(s);
+    }
+    // Lift away and end above the target
+    out.extend(seg_positions(s, t, 0.0, v));
+    info!("Trajectory sampled into {} servo points", out.len());
+
+    // Enter servo mode, the joint filter goes on before enabling
+    let h = *handle;
+    if unsafe { binding::servo_move_use_joint_NLF(&h, NLF_VR, NLF_AR, NLF_JR) } != binding::ERR_SUCC
+    {
+        warn!("Joint NLF filter is not supported, running without it");
+    }
+    check("Enable servo mode", unsafe {
+        binding::servo_move_enable(&h, 1)
+    })?;
+
+    let suck = |on: bool| -> Result<(), String> {
+        let state = on as BOOL;
+        for i in 0..2 {
+            check(&format!("Set tool DO{i}"), unsafe {
+                binding::set_digital_output(&h, binding::IOType::Tool, i, state)
+            })?;
+        }
+        info!("Suction {}", if on { "on" } else { "off" });
+        Ok(())
+    };
+
+    let mut ticker = tokio::time::interval(cadence);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut fired = [false, false];
+    let mut send_err: Option<String> = None;
+    for (i, (x, y, z)) in out.iter().enumerate() {
+        ticker.tick().await;
+        for (k, ev) in events.iter().enumerate() {
+            if ev.0 == i && !fired[k] {
+                if let Err(e) = suck(ev.1) {
+                    send_err = Some(e);
+                }
+                fired[k] = true;
+            }
+        }
+        let mut pose = CartesianPose::zero();
+        pose.tran.x = *x;
+        pose.tran.y = *y;
+        pose.tran.z = *z;
+        pose.rpy.rx = cur.rpy.rx;
+        pose.rpy.ry = cur.rpy.ry;
+        pose.rpy.rz = cur.rpy.rz;
+        let ret = unsafe { binding::servo_p(&h, &pose, MoveMode::Abs, 2) };
+        if ret != binding::ERR_SUCC {
+            send_err = Some(format!("Servo pulse rejected: {}", servo_err_hint(ret)));
+            break;
+        }
+        if send_err.is_some() {
+            break;
+        }
+    }
+
+    let mut final_pose = CartesianPose::zero();
+    final_pose.tran.x = t.0;
+    final_pose.tran.y = t.1;
+    final_pose.tran.z = t.2;
+    final_pose.rpy.rx = cur.rpy.rx;
+    final_pose.rpy.ry = cur.rpy.ry;
+    final_pose.rpy.rz = cur.rpy.rz;
+    if let Some(e) = send_err {
+        let _ = unsafe { binding::motion_abort(&h) };
+        let _ = unsafe { binding::servo_move_enable(&h, 0) };
+        return Err(e);
+    }
+    for _ in 0..6 {
+        ticker.tick().await;
+        let _ = unsafe { binding::servo_p(&h, &final_pose, MoveMode::Abs, 2) };
+    }
+    let _ = tokio::time::sleep(Duration::from_millis(32)).await;
+    let mut off = unsafe { binding::servo_move_enable(&h, 0) };
+    if off != binding::ERR_SUCC {
+        let _ = tokio::time::sleep(Duration::from_millis(64)).await;
+        off = unsafe { binding::servo_move_enable(&h, 0) };
+    }
+    if off != binding::ERR_SUCC {
+        warn!(
+            "Disable servo mode returned {}, the arm already left servo mode",
+            servo_err_hint(off)
+        );
+    }
+    info!("Continuous grab complete");
+    Ok(())
+}
+
+/// Sample one straight or arc segment into 8 ms servo poses, from rest at
+/// start to rest at end. An apex > 0 shapes a parabola that rises apex mm
+/// above the straight line in the middle. The output is used by grab to
+/// concatenate several segments into one continuous trajectory
+fn seg_positions(
+    start: (f64, f64, f64),
+    end: (f64, f64, f64),
+    apex: f64,
+    v: f64,
+) -> Vec<(f64, f64, f64)> {
+    const ACC: f64 = 400.0; // mm/s^2 feed acceleration
+    const TAU: f64 = 1e-4;
+    let (sx, sy, sz) = start;
+    let (ex, ey, ez) = end;
+    let (dx, dy, dz) = (ex - sx, ey - sy, ez - sz);
+    let path = |u: f64| {
+        let z = sz + dz * u + apex * 4.0 * u * (1.0 - u);
+        (sx + dx * u, sy + dy * u, z)
+    };
+    let metric = |u: f64| {
+        let a = path(u - TAU);
+        let b = path(u + TAU);
+        ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2) + (b.2 - a.2).powi(2)).sqrt() / (2.0 * TAU)
+    };
+    const SEGS: usize = 512;
+    let mut len = 0.0;
+    for k in 0..SEGS {
+        len += metric((k as f64 + 0.5) / SEGS as f64) / SEGS as f64;
+    }
+    let dt = SERVO_PERIOD.as_secs_f64() * 2.0; // 16 ms, the streaming cadence
+    let v = v.max(1.0);
+    let mut out = Vec::new();
+    out.push((sx, sy, sz));
+    let mut u = 0.0;
+    let mut s = 0.0;
+    let mut vel = 0.0;
+    loop {
+        let remain = (len - s).max(0.0);
+        let vstop = (2.0 * ACC * remain).sqrt();
+        let cap = v.min(vstop);
+        if vel < cap {
+            vel = (vel + ACC * dt).min(cap);
+        } else if vel > cap {
+            vel = (vel - ACC * dt).max(cap);
+        }
+        let m = metric(u);
+        let du = if m > 1e-9 { vel * dt / m } else { 0.0 };
+        u = (u + du).min(1.0);
+        s += vel * dt;
+        out.push(path(u));
+        if u >= 1.0 - 1e-9 || s >= len - 1e-6 {
+            break;
+        }
+        if out.len() > 20000 {
+            break;
+        }
+    }
+    if let Some(last) = out.last_mut() {
+        *last = (ex, ey, ez);
+    }
+    out
 }
 
 /// Execute a joint move and return the actual TCP pose after it. The SDK
