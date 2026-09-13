@@ -229,6 +229,10 @@ pub enum Command {
         /// Rise of the carry arc above the straight line in mm
         #[arg(long, default_value_t = 80.0, allow_negative_numbers = true)]
         apex: f64,
+        /// Cruise height for the carry, relative to the base point in mm: the
+        /// block is lifted straight up to it before the arc across
+        #[arg(long, default_value_t = -40.0, allow_negative_numbers = true)]
+        lift: f64,
         /// Linear speed in mm/s, the servo caps it itself
         #[arg(long, default_value_t = 2000.0)]
         speed: f64,

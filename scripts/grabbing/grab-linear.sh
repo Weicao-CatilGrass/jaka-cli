@@ -21,9 +21,9 @@ fromy=$2
 tox=$3
 toy=$4
 
-SPEED=${SPEED:-2000}   # speed of every move in mm/s
-MID_Z=-40              # cruise height, above the block while traveling
-GRAB_Z=-125            # head height where the cup touches the block top
+SPEED=${SPEED:-2000}          # speed of every move in mm/s
+MID_Z=${MID_Z:--40}           # cruise height, above the block while traveling
+GRAB_Z=${GRAB_Z:--125}        # head height where the cup touches the block top
 
 # Controller and binary, override via the environment
 IP=${JAKA_IP:-10.5.5.100}

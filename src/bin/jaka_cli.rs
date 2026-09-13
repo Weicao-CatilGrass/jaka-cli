@@ -285,6 +285,7 @@ fn print_plan(args: &Cli, command: &Command) {
             tox,
             toy,
             apex,
+            lift,
             speed,
             rel,
         } => {
@@ -293,7 +294,9 @@ fn print_plan(args: &Cli, command: &Command) {
                 "[dry-run] Will connect to controller {} and run one continuous grab from ({fromx}, {fromy}) to ({tox}, {toy}) mm ({mode})",
                 args.ip
             );
-            info!("[dry-run] Carry apex {apex:.0} mm, linear speed {speed:.0} mm/s");
+            info!(
+                "[dry-run] Lift to {lift} mm, carry apex {apex:.0} mm, linear speed {speed:.0} mm/s"
+            );
         }
         Command::SetBase => info!(
             "[dry-run] Will connect to controller {} and save the current TCP as the base pose",
@@ -606,9 +609,15 @@ async fn drive(handle: &JKHD, command: &Command, stdout_fd: i32) -> Result<(), S
                     tox,
                     toy,
                     apex,
+                    lift,
                     speed,
                     rel,
-                } => grab(handle, *fromx, *fromy, *tox, *toy, *apex, *speed, *rel).await,
+                } => {
+                    grab(
+                        handle, *fromx, *fromy, *tox, *toy, *apex, *lift, *speed, *rel,
+                    )
+                    .await
+                }
                 Command::Do {
                     io_where,
                     index,
@@ -1570,9 +1579,9 @@ async fn arc(
 /// continuous servo trajectory. The offsets are relative to the base pose,
 /// so a --rel grab expects the block on the table under the base point.
 /// The motion is a single stream: rise to hover over the source, probe down
-/// to grab (suction on, hold), arc over to hover above the target, probe
-/// down to seat (suction off, hold), lift away. There is no stop between
-/// the segments, only the two suction dwells
+/// to grab (suction on, hold), lift straight up to the carry height, arc
+/// across to above the target, probe down to seat (suction off, hold), lift
+/// away. There is no stop between the segments, only the two suction dwells
 async fn grab(
     handle: &JKHD,
     fromx: f64,
@@ -1580,6 +1589,7 @@ async fn grab(
     tox: f64,
     toy: f64,
     apex: f64,
+    lift: f64,
     speed: f64,
     rel: bool,
 ) -> Result<(), String> {
@@ -1604,11 +1614,11 @@ async fn grab(
     };
 
     let (bx, by, bz) = (base.tran.x, base.tran.y, base.tran.z);
-    let (az, gz) = (bz + APPROACH_OFF, bz + GRAB_OFF);
+    let (az, gz, hz) = (bz + APPROACH_OFF, bz + GRAB_OFF, bz + lift);
     let a = (bx + fromx, by + fromy, az);
     let b = (bx + fromx, by + fromy, gz);
     let s = (bx + tox, by + toy, gz);
-    let t = (bx + tox, by + toy, az);
+    let t = (bx + tox, by + toy, hz);
 
     let mut cur = CartesianPose::zero();
     check("Read TCP position", unsafe {
@@ -1636,8 +1646,13 @@ async fn grab(
     for _ in 0..hold_ticks {
         out.push(b);
     }
-    // Carry in an arc to hover over the target, then probe down to seat it
-    out.extend(seg_positions(b, s, apex, v));
+    // Lift straight up to the carry height, arc across to above the target,
+    // then probe straight down to seat it
+    let hsrc = (a.0, a.1, hz);
+    let hdst = (t.0, t.1, hz);
+    out.extend(seg_positions(b, hsrc, 0.0, v));
+    out.extend(seg_positions(hsrc, hdst, apex, v));
+    out.extend(seg_positions(hdst, s, 0.0, v));
     let off_at = out.len() - 1;
     events.push((off_at, false));
     for _ in 0..seat_ticks {

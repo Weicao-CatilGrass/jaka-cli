@@ -28,6 +28,7 @@ toy=$4
 
 SPEED=${SPEED:-2000}   # linear speed in mm/s, the servo clamps it
 APEX=${APEX:-80}       # rise of the carry arc above the straight line in mm
+LIFT=${LIFT:--40}      # cruise height, the block is lifted straight up to it first
 
 # Controller and binary, override via the environment
 IP=${JAKA_IP:-10.5.5.100}
@@ -46,4 +47,5 @@ if [ -z "${CLI:-}" ]; then
 fi
 
 echo "grab from rel ($fromx, $fromy) to rel ($tox, $toy)"
-exec "$CLI" --ip "$IP" grab "$fromx" "$fromy" "$tox" "$toy" --rel --apex "$APEX" --speed "$SPEED"
+exec "$CLI" --ip "$IP" grab "$fromx" "$fromy" "$tox" "$toy" --rel \
+    --apex "$APEX" --lift "$LIFT" --speed "$SPEED"
